@@ -9,14 +9,14 @@ WPAN_MENU:=Wireless Drivers
 define KernelPackage/ieee802154
   SUBMENU:=$(WPAN_MENU)
   TITLE:=IEEE-802.15.4 support
-  DEPENDS:=@LINUX_4_0
+#  DEPENDS:=@LINUX_4_0
   KCONFIG:= \
 	CONFIG_IEEE802154 \
 	CONFIG_IEEE802154_SOCKET=y
   FILES:= \
 	$(LINUX_DIR)/net/ieee802154/ieee802154.ko \
 	$(LINUX_DIR)/net/ieee802154/ieee802154_socket.ko
-  AUTOLOAD:=$(call AutoLoad,90,ieee802154 ieee802154_socket)
+ AUTOLOAD:=$(call AutoLoad,90,ieee802154 ieee802154_socket)
 endef
 
 define KernelPackage/ieee802154/description
@@ -32,11 +32,11 @@ $(eval $(call KernelPackage,ieee802154))
 define KernelPackage/mac802154
   SUBMENU:=$(WPAN_MENU)
   TITLE:=MAC-802.15.4 support
-  DEPENDS:=@LINUX_4_0
+  DEPENDS:=+kmod-ieee802154 +kmod-crypto-aead +kmod-lib-crc-ccitt 
+#@LINUX_4_0
   KCONFIG:= \
 	CONFIG_MAC802154 \
 	CONFIG_IEEE802154_DRIVERS=y
-  DEPENDS:=+kmod-ieee802154 +kmod-crypto-aead +kmod-lib-crc-ccitt @LINUX_4_0
   FILES:=$(LINUX_DIR)/net/mac802154/mac802154.ko
   AUTOLOAD:=$(call AutoLoad,91,mac802154)
 endef
@@ -56,7 +56,8 @@ $(eval $(call KernelPackage,mac802154))
 define KernelPackage/fakelb
   SUBMENU:=$(WPAN_MENU)
   TITLE:=Fake LR-WPAN driver
-  DEPENDS:=+kmod-mac802154 @LINUX_4_0
+  DEPENDS:=+kmod-mac802154 
+#@LINUX_4_0
   KCONFIG:=CONFIG_IEEE802154_FAKELB
   FILES:=$(LINUX_DIR)/drivers/net/ieee802154/fakelb.ko
   AUTOLOAD:=$(call AutoLoad,92,fakelb)
@@ -105,13 +106,43 @@ endef
 
 $(eval $(call KernelPackage,cc2520))
 
+
+define KernelPackage/ATUSB
+  SUBMENU:=$(WPAN_MENU)
+  TITLE:=AT USB transceiver driver
+  DEPENDS:=+kmod-mac802154
+  KCONFIG:=CONFIG_IEEE802154_ATUSB
+  FILES:=$(LINUX_DIR)/drivers/net/ieee802154/atusb.ko
+endef
+
+$(eval $(call KernelPackage,ATUSB))
+
+
 define KernelPackage/ieee802154_6lowpan
   SUBMENU:=$(WPAN_MENU)
   TITLE:= 6LoWPAN support over IEEE-802.15.4
-  DEPENDS:=@LINUX_4_0
-  KCONFIG:=CONFIG_IEEE802154_6LOWPAN
-  FILES:=$(LINUX_DIR)/net/ieee802154/6lowpan/ieee802154_6lowpan.ko
-  AUTOLOAD:=$(call AutoLoad,91,ieee802154_6lowpan)
+#  DEPENDS:=@LINUX_4_0 +kmod-6lowpan
+  DEPENDS:=+kmod-6lowpan +kmod-ieee802154
+  KCONFIG:=CONFIG_IEEE802154_6LOWPAN=y\
+	CONFIG_6LOWPAN_NHC=y\
+	CONFIG_6LOWPAN_NHC_DEST=y\
+	CONFIG_6LOWPAN_NHC_FRAGMENT=y\
+	CONFIG_6LOWPAN_NHC_HOP=y\
+	CONFIG_6LOWPAN_NHC_IPV6=y\
+	CONFIG_6LOWPAN_NHC_MOBILITY=y\
+	CONFIG_6LOWPAN_NHC_ROUTING=y\
+	CONFIG_6LOWPAN_NHC_UDP=y
+  FILES:= \
+	$(LINUX_DIR)/net/6lowpan/nhc_mobility.ko\
+	$(LINUX_DIR)/net/6lowpan/nhc_fragment.ko\
+	$(LINUX_DIR)/net/6lowpan/nhc_ipv6.ko\
+	$(LINUX_DIR)/net/6lowpan/nhc_routing.ko\
+	$(LINUX_DIR)/net/6lowpan/nhc_dest.ko\
+	$(LINUX_DIR)/net/6lowpan/nhc_udp.ko\
+	$(LINUX_DIR)/net/6lowpan/nhc_hop.ko\
+	$(LINUX_DIR)/net/6lowpan/6lowpan.ko\
+	$(LINUX_DIR)/net/ieee802154/6lowpan/ieee802154_6lowpan.ko
+  AUTOLOAD:=$(call AutoLoad,91, 6lowpan ieee802154_6lowpan nhc_mobility.ko nhc_fragment.ko nhc_ipv6.ko nhc_routing.ko nhc_dest.ko nhc_udp.ko nhc_hop.ko)
 endef
 
 define KernelPackage/ieee802154_6lowpan/description
