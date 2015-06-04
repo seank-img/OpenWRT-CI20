@@ -73,11 +73,12 @@ $(eval $(call KernelPackage,fakelb))
 define KernelPackage/at86rf230
   SUBMENU:=$(WPAN_MENU)
   TITLE:=AT86RF230 transceiver driver
-  DEPENDS:=+kmod-mac802154
+  DEPENDS:=+kmod-mac802154 +kmod-regmap-spi
   KCONFIG:=CONFIG_IEEE802154_AT86RF230 \
 	CONFIG_SPI=y \
 	CONFIG_SPI_MASTER=y
-  FILES:=$(LINUX_DIR)/drivers/net/ieee802154/at86rf230.ko
+  FILES:=$(LINUX_DIR)/drivers/net/ieee802154/at86rf230.ko\
+	 $(LINUX_DIR)/drivers/base/regmap/regmap-spi.ko
 endef
 
 $(eval $(call KernelPackage,at86rf230))
