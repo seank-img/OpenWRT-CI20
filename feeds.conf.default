@@ -13,3 +13,4 @@ src-git oldpackages http://git.openwrt.org/packages.git
 #src-svn xfce svn://svn.openwrt.org/openwrt/feeds/xfce
 #src-svn lxde svn://svn.openwrt.org/openwrt/feeds/lxde
 #src-link custom /usr/src/openwrt/custom-feed
+src-git imgtec http://gitlab.flowcloud.systems/Christopher.Dewbery/imgtec-openwrt-packages.git
