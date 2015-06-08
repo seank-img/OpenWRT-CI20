@@ -293,6 +293,6 @@
         reset-gpio = <&gpf 2 1>;
         sleep-tpio = <&gpe 8 1>;
 	xtal-trim = /bits/ 8 <0x0F>;
-        spi-max-frequency = <25000>;
+        spi-max-frequency = <500000>;
     };
 };
