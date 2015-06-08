@@ -288,10 +288,11 @@
         reg = <0>;
         
 	interrupt-parent = <&gpf>;
-        interrupts = <3 1>;
+        interrupts = <1 4>;
 
         reset-gpio = <&gpe 8 1>;
         sleep-tpio = <&gpf 2 1>;
+	xtal-trim = <15>;
         spi-max-frequency = <10000>;
     };
 };

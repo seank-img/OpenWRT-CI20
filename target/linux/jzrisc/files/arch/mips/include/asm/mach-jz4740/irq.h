@@ -23,7 +23,7 @@
 # define NR_INTC_IRQS	32
 #endif
 #ifdef CONFIG_MACH_JZ4780
-# define NR_INTC_IRQS	64
+# define NR_INTC_IRQS	128
 #endif
 
 /* 1st-level interrupts */

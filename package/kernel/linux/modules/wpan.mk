@@ -79,6 +79,7 @@ define KernelPackage/at86rf230
 	CONFIG_SPI_MASTER=y
   FILES:=$(LINUX_DIR)/drivers/net/ieee802154/at86rf230.ko\
 	 $(LINUX_DIR)/drivers/base/regmap/regmap-spi.ko
+  AUTOLOAD:=$(call AutoLoad,92, regmap-spi at86rf230)	
 endef
 
 $(eval $(call KernelPackage,at86rf230))
