@@ -92,6 +92,7 @@ define KernelPackage/mrf24j40
 	CONFIG_SPI=y \
 	CONFIG_SPI_MASTER=y
   FILES:=$(LINUX_DIR)/drivers/net/ieee802154/mrf24j40.ko
+  AUTOLOAD:=$(call AutoLoad,92, mrf24j40)	
 endef
 
 $(eval $(call KernelPackage,mrf24j40))

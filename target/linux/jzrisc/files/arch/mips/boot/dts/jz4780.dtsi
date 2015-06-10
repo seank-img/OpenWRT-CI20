@@ -390,8 +390,9 @@
 	                gpio-sck = <&gpe 15 0>; 	/* PE15 - SS0_CLK  */
 	                gpio-miso = <&gpe 14 0>;   	/* PE14 - SS0_DR */
 	                gpio-mosi = <&gpe 17 0>;	/* PE17 - SS0_DT */
-	                cs-gpios = <&gpe 16 0>;		/* PE16 - SSo_CE */
-	                num-chipselects = <1>;
+	                cs-gpios = <&gpe 16 0		/* PE16 - SSo_CE */
+								&gpe 18 0>;		/* PE18 - SS1_CE */
+	                num-chipselects = <2>;
 
 	                /* clients */
 
