@@ -373,9 +373,10 @@
 			pinfunc_spi0: spi0 {
 				pins_spi0_data: spi0-data{
 					 ingenic,pins = <&gpe 15 0 &pincfg_nobias 	/* CLK */
-                                                         &gpe 14 0 &pincfg_nobias	/* DR */
+							 &gpe 14 0 &pincfg_nobias	/* DR */
 							 &gpe 17 0 &pincfg_nobias	/* DT */
-							 &gpe 16 0 &pincfg_nobias>; 	/* CE */
+							 &gpe 16 0 &pincfg_nobias 	/* CE0 */
+							 &gpe 18 0 &pincfg_nobias>; /* CE1 */
 
 				};
 			};
