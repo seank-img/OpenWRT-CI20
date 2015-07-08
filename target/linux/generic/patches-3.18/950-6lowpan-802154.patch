@@ -1,6 +1,6 @@
 diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf230.c
---- a/drivers/net/ieee802154/at86rf230.c	2015-06-03 16:51:05.007929127 +1200
-+++ b/drivers/net/ieee802154/at86rf230.c	2015-06-03 16:51:05.371929118 +1200
+--- a/drivers/net/ieee802154/at86rf230.c	2015-07-09 11:34:31.604893413 +1200
++++ b/drivers/net/ieee802154/at86rf230.c	2015-07-09 11:34:32.161171408 +1200
 @@ -12,10 +12,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -39,8 +39,12 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  
  struct at86rf230_local;
  /* at86rf2xx chip depend data.
-@@ -50,23 +49,27 @@
+@@ -48,25 +47,31 @@
+ 	u16 t_reset_to_off;
+ 	u16 t_off_to_aack;
  	u16 t_off_to_tx_on;
++	u16 t_off_to_sleep;
++	u16 t_sleep_to_off;
  	u16 t_frame;
  	u16 t_p_ack;
 -	/* short interframe spacing time */
@@ -76,7 +80,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	struct spi_message msg;
  	struct spi_transfer trx;
  	u8 buf[AT86RF2XX_MAX_BUF];
-@@ -74,14 +77,17 @@
+@@ -74,14 +79,18 @@
  	void (*complete)(void *context);
  	u8 from_state;
  	u8 to_state;
@@ -92,10 +96,11 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	struct at86rf2xx_chip_data *data;
  	struct regmap *regmap;
 +	int slp_tr;
++	bool sleep;
  
  	struct completion state_complete;
  	struct at86rf230_state_change state;
-@@ -89,212 +95,22 @@
+@@ -89,225 +98,83 @@
  	struct at86rf230_state_change irq;
  
  	bool tx_aret;
@@ -312,10 +317,73 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
 -			     const u8 state, void (*complete)(void *context));
 +			     const u8 state, void (*complete)(void *context),
 +			     const bool irq_enable);
++
++static inline void
++at86rf230_sleep(struct at86rf230_local *lp)
++{
++	if (gpio_is_valid(lp->slp_tr)) {
++		gpio_set_value(lp->slp_tr, 1);
++		usleep_range(lp->data->t_off_to_sleep,
++			     lp->data->t_off_to_sleep + 10);
++		lp->sleep = true;
++	}
++}
++
++static inline void
++at86rf230_awake(struct at86rf230_local *lp)
++{
++	if (gpio_is_valid(lp->slp_tr)) {
++		gpio_set_value(lp->slp_tr, 0);
++		usleep_range(lp->data->t_sleep_to_off,
++			     lp->data->t_sleep_to_off + 100);
++		lp->sleep = false;
++	}
++}
  
  static inline int
  __at86rf230_write(struct at86rf230_local *lp,
-@@ -318,7 +134,7 @@
+ 		  unsigned int addr, unsigned int data)
+ {
+-	return regmap_write(lp->regmap, addr, data);
++	bool sleep = lp->sleep;
++	int ret;
++
++	/* awake for register setting if sleep */
++	if (sleep)
++		at86rf230_awake(lp);
++
++	ret = regmap_write(lp->regmap, addr, data);
++
++	/* sleep again if was sleeping */
++	if (sleep)
++		at86rf230_sleep(lp);
++
++	return ret;
+ }
+ 
+ static inline int
+ __at86rf230_read(struct at86rf230_local *lp,
+ 		 unsigned int addr, unsigned int *data)
+ {
+-	return regmap_read(lp->regmap, addr, data);
++	bool sleep = lp->sleep;
++	int ret;
++
++	/* awake for register setting if sleep */
++	if (sleep)
++		at86rf230_awake(lp);
++
++	ret = regmap_read(lp->regmap, addr, data);
++
++	/* sleep again if was sleeping */
++	if (sleep)
++		at86rf230_sleep(lp);
++
++	return ret;
+ }
+ 
+ static inline int
+@@ -318,7 +185,7 @@
  	int rc;
  
  	rc = __at86rf230_read(lp, addr, data);
@@ -324,22 +392,37 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		*data = (*data & mask) >> shift;
  
  	return rc;
-@@ -332,6 +148,14 @@
- 	return regmap_update_bits(lp->regmap, addr, mask, data << shift);
- }
- 
+@@ -329,7 +196,28 @@
+ 		       unsigned int addr, unsigned int mask,
+ 		       unsigned int shift, unsigned int data)
+ {
+-	return regmap_update_bits(lp->regmap, addr, mask, data << shift);
++	bool sleep = lp->sleep;
++	int ret;
++
++	/* awake for register setting if sleep */
++	if (sleep)
++		at86rf230_awake(lp);
++
++	ret = regmap_update_bits(lp->regmap, addr, mask, data << shift);
++
++	/* sleep again if was sleeping */
++	if (sleep)
++		at86rf230_sleep(lp);
++
++	return ret;
++}
++
 +static inline void
 +at86rf230_slp_tr_rising_edge(struct at86rf230_local *lp)
 +{
 +	gpio_set_value(lp->slp_tr, 1);
 +	udelay(1);
 +	gpio_set_value(lp->slp_tr, 0);
-+}
-+
+ }
+ 
  static bool
- at86rf230_reg_writeable(struct device *dev, unsigned int reg)
- {
-@@ -414,6 +238,8 @@
+@@ -414,6 +302,8 @@
  	case RG_PHY_ED_LEVEL:
  	case RG_IRQ_STATUS:
  	case RG_VREG_CTRL:
@@ -348,7 +431,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		return true;
  	default:
  		return false;
-@@ -432,7 +258,7 @@
+@@ -432,7 +322,7 @@
  	}
  }
  
@@ -357,7 +440,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	.reg_bits = 8,
  	.val_bits = 8,
  	.write_flag_mask = CMD_REG | CMD_WRITE,
-@@ -451,31 +277,50 @@
+@@ -451,31 +341,50 @@
  	struct at86rf230_state_change *ctx = context;
  	struct at86rf230_local *lp = ctx->lp;
  
@@ -415,7 +498,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  }
  
  static void
-@@ -484,7 +329,7 @@
+@@ -484,7 +393,7 @@
  	struct at86rf230_state_change *ctx = context;
  	struct at86rf230_local *lp = ctx->lp;
  	const u8 *buf = ctx->buf;
@@ -424,7 +507,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  
  	/* Assert state change */
  	if (trx_state != ctx->to_state) {
-@@ -508,16 +353,27 @@
+@@ -508,16 +417,27 @@
  			 * in STATE_BUSY_RX_AACK, we run a force state change
  			 * to STATE_TX_ON. This is a timeout handling, if the
  			 * transceiver stucks in STATE_BUSY_RX_AACK.
@@ -457,7 +540,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		dev_warn(&lp->spi->dev, "unexcept state change from 0x%02x to 0x%02x. Actual state: 0x%02x\n",
  			 ctx->from_state, ctx->to_state, trx_state);
  	}
-@@ -527,6 +383,19 @@
+@@ -527,6 +447,19 @@
  		ctx->complete(context);
  }
  
@@ -477,7 +560,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  /* Do state change timing delay. */
  static void
  at86rf230_async_state_delay(void *context)
-@@ -535,7 +404,7 @@
+@@ -535,7 +468,7 @@
  	struct at86rf230_local *lp = ctx->lp;
  	struct at86rf2xx_chip_data *c = lp->data;
  	bool force = false;
@@ -486,7 +569,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  
  	/* The force state changes are will show as normal states in the
  	 * state status subregister. We change the to_state to the
-@@ -559,11 +428,21 @@
+@@ -559,11 +492,21 @@
  	case STATE_TRX_OFF:
  		switch (ctx->to_state) {
  		case STATE_RX_AACK_ON:
@@ -511,7 +594,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  			goto change;
  		default:
  			break;
-@@ -571,14 +450,15 @@
+@@ -571,14 +514,15 @@
  		break;
  	case STATE_BUSY_RX_AACK:
  		switch (ctx->to_state) {
@@ -530,7 +613,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  				goto change;
  			}
  			break;
-@@ -590,7 +470,7 @@
+@@ -590,7 +534,7 @@
  	case STATE_P_ON:
  		switch (ctx->to_state) {
  		case STATE_TRX_OFF:
@@ -539,7 +622,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  			goto change;
  		default:
  			break;
-@@ -601,13 +481,10 @@
+@@ -601,13 +545,10 @@
  	}
  
  	/* Default delay is 1us in the most cases */
@@ -555,7 +638,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  }
  
  static void
-@@ -616,16 +493,15 @@
+@@ -616,16 +557,15 @@
  	struct at86rf230_state_change *ctx = context;
  	struct at86rf230_local *lp = ctx->lp;
  	u8 *buf = ctx->buf;
@@ -576,7 +659,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		return;
  	}
  
-@@ -644,23 +520,29 @@
+@@ -644,23 +584,29 @@
  	 */
  	buf[0] = (RG_TRX_STATE & CMD_REG_MASK) | CMD_REG | CMD_WRITE;
  	buf[1] = ctx->to_state;
@@ -613,7 +696,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  }
  
  static void
-@@ -679,19 +561,18 @@
+@@ -679,19 +625,18 @@
  static int
  at86rf230_sync_state_change(struct at86rf230_local *lp, unsigned int state)
  {
@@ -640,7 +723,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  
  	return 0;
  }
-@@ -702,33 +583,19 @@
+@@ -702,33 +647,19 @@
  	struct at86rf230_state_change *ctx = context;
  	struct at86rf230_local *lp = ctx->lp;
  
@@ -679,7 +762,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  }
  
  static void
-@@ -738,139 +605,109 @@
+@@ -738,139 +669,109 @@
  	struct at86rf230_local *lp = ctx->lp;
  	const u8 *buf = ctx->buf;
  	const u8 trac = (buf[1] & 0xe0) >> 5;
@@ -866,7 +949,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	}
  }
  
-@@ -879,16 +716,13 @@
+@@ -879,16 +780,13 @@
  {
  	struct at86rf230_state_change *ctx = context;
  	struct at86rf230_local *lp = ctx->lp;
@@ -886,7 +969,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		dev_err(&lp->spi->dev, "not supported irq %02x received\n",
  			irq);
  	}
-@@ -901,13 +735,13 @@
+@@ -901,13 +799,13 @@
  	u8 *buf = ctx->buf;
  	int rc;
  
@@ -902,7 +985,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		at86rf230_async_error(lp, ctx, rc);
  		return IRQ_NONE;
  	}
-@@ -923,13 +757,18 @@
+@@ -923,13 +821,18 @@
  	u8 *buf = ctx->buf;
  	int rc;
  
@@ -927,7 +1010,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  }
  
  static void
-@@ -938,21 +777,21 @@
+@@ -938,21 +841,21 @@
  	struct at86rf230_state_change *ctx = context;
  	struct at86rf230_local *lp = ctx->lp;
  	struct sk_buff *skb = lp->tx_skb;
@@ -956,7 +1039,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  }
  
  static void
-@@ -960,87 +799,137 @@
+@@ -960,87 +863,158 @@
  {
  	struct at86rf230_state_change *ctx = context;
  	struct at86rf230_local *lp = ctx->lp;
@@ -1025,14 +1108,14 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
 +{
 +	struct at86rf230_local *lp = hw->priv;
 +	struct at86rf230_state_change *ctx = &lp->tx;
++
++	lp->tx_skb = skb;
++	lp->tx_retry = 0;
  
 -	/* Interfame spacing time, which is phy depend.
 -	 * TODO
 -	 * Move this handling in MAC 802.15.4 layer.
 -	 * This is currently a workaround to avoid fragmenation issues.
-+	lp->tx_skb = skb;
-+	lp->tx_retry = 0;
-+
 +	/* After 5 minutes in PLL and the same frequency we run again the
 +	 * calibration loops which is recommended by at86rf2xx datasheets.
 +	 *
@@ -1070,7 +1153,12 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
 +at86rf230_start(struct ieee802154_hw *hw)
  {
 -	return at86rf230_sync_state_change(dev->priv, STATE_RX_AACK_ON);
-+	return at86rf230_sync_state_change(hw->priv, STATE_RX_AACK_ON);
++	struct at86rf230_local *lp = hw->priv;
++
++	at86rf230_awake(lp);
++	enable_irq(lp->spi->irq);
++
++	return at86rf230_sync_state_change(lp, STATE_RX_AACK_ON);
  }
  
  static void
@@ -1078,7 +1166,23 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
 +at86rf230_stop(struct ieee802154_hw *hw)
  {
 -	at86rf230_sync_state_change(dev->priv, STATE_FORCE_TRX_OFF);
-+	at86rf230_sync_state_change(hw->priv, STATE_FORCE_TRX_OFF);
++	struct at86rf230_local *lp = hw->priv;
++	u8 csma_seed[2];
++
++	at86rf230_sync_state_change(lp, STATE_FORCE_TRX_OFF);
++
++	disable_irq(lp->spi->irq);
++
++	/* It's recommended to set random new csma_seeds before sleep state.
++	 * Makes only sense in the stop callback, not doing this inside of
++	 * at86rf230_sleep, this is also used when we don't transmit afterwards
++	 * when calling start callback again.
++	 */
++	get_random_bytes(csma_seed, ARRAY_SIZE(csma_seed));
++	at86rf230_write_subreg(lp, SR_CSMA_SEED_0, csma_seed[0]);
++	at86rf230_write_subreg(lp, SR_CSMA_SEED_1, csma_seed[1]);
++
++	at86rf230_sleep(lp);
  }
  
  static int
@@ -1138,7 +1242,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  {
  	int rc;
  
-@@ -1061,74 +950,96 @@
+@@ -1061,74 +1035,96 @@
  	if (rc < 0)
  		return rc;
  
@@ -1261,7 +1365,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		if (filt->pan_coord)
  			at86rf230_write_subreg(lp, SR_AACK_I_AM_COORD, 1);
  		else
-@@ -1138,75 +1049,122 @@
+@@ -1138,75 +1134,122 @@
  	return 0;
  }
  
@@ -1288,8 +1392,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
 +at86rf23x_set_txpower(struct at86rf230_local *lp, s32 mbm)
  {
 -	struct at86rf230_local *lp = dev->priv;
-+	u32 i;
- 
+-
 -	/* typical maximum output is 5dBm with RG_PHY_TX_PWR 0x60, lower five
 -	 * bits decrease power in 1dB steps. 0x60 represents extra PA gain of
 -	 * 0dB.
@@ -1298,7 +1401,8 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
 -	 */
 -	if (db > 5 || db < -26)
 -		return -EINVAL;
--
++	u32 i;
+ 
 -	db = -(db - 5);
 +	for (i = 0; i < lp->hw->phy->supported.tx_powers_size; i++) {
 +		if (lp->hw->phy->supported.tx_powers[i] == mbm)
@@ -1418,7 +1522,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	rc = at86rf230_write_subreg(lp, SR_MIN_BE, min_be);
  	if (rc)
  		return rc;
-@@ -1219,15 +1177,13 @@
+@@ -1219,15 +1262,13 @@
  }
  
  static int
@@ -1437,7 +1541,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  
  	if (retries >= 0)
  		rc = at86rf230_write_subreg(lp, SR_MAX_FRAME_RETRIES, retries);
-@@ -1235,9 +1191,36 @@
+@@ -1235,9 +1276,36 @@
  	return rc;
  }
  
@@ -1476,7 +1580,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	.ed = at86rf230_ed,
  	.set_channel = at86rf230_channel,
  	.start = at86rf230_start,
-@@ -1249,6 +1232,7 @@
+@@ -1249,6 +1317,7 @@
  	.set_cca_ed_level = at86rf230_set_cca_ed_level,
  	.set_csma_params = at86rf230_set_csma_params,
  	.set_frame_retries = at86rf230_set_frame_retries,
@@ -1484,8 +1588,12 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  };
  
  static struct at86rf2xx_chip_data at86rf233_data = {
-@@ -1259,12 +1243,9 @@
+@@ -1257,14 +1326,13 @@
+ 	.t_reset_to_off = 26,
+ 	.t_off_to_aack = 80,
  	.t_off_to_tx_on = 80,
++	.t_off_to_sleep = 35,
++	.t_sleep_to_off = 210,
  	.t_frame = 4096,
  	.t_p_ack = 545,
 -	.t_sifs = 192,
@@ -1498,8 +1606,12 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  };
  
  static struct at86rf2xx_chip_data at86rf231_data = {
-@@ -1275,12 +1256,9 @@
+@@ -1273,14 +1341,13 @@
+ 	.t_reset_to_off = 37,
+ 	.t_off_to_aack = 110,
  	.t_off_to_tx_on = 110,
++	.t_off_to_sleep = 35,
++	.t_sleep_to_off = 380,
  	.t_frame = 4096,
  	.t_p_ack = 545,
 -	.t_sifs = 192,
@@ -1512,8 +1624,12 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  };
  
  static struct at86rf2xx_chip_data at86rf212_data = {
-@@ -1291,15 +1269,12 @@
+@@ -1289,17 +1356,16 @@
+ 	.t_reset_to_off = 26,
+ 	.t_off_to_aack = 200,
  	.t_off_to_tx_on = 200,
++	.t_off_to_sleep = 35,
++	.t_sleep_to_off = 380,
  	.t_frame = 4096,
  	.t_p_ack = 545,
 -	.t_sifs = 192,
@@ -1530,7 +1646,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  {
  	int rc, irq_type, irq_pol = IRQ_ACTIVE_HIGH;
  	unsigned int dvdd;
-@@ -1310,7 +1285,12 @@
+@@ -1310,7 +1376,12 @@
  		return rc;
  
  	irq_type = irq_get_trigger_type(lp->spi->irq);
@@ -1544,7 +1660,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  		irq_pol = IRQ_ACTIVE_LOW;
  
  	rc = at86rf230_write_subreg(lp, SR_IRQ_POLARITY, irq_pol);
-@@ -1325,6 +1305,11 @@
+@@ -1325,6 +1396,11 @@
  	if (rc)
  		return rc;
  
@@ -1556,7 +1672,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	get_random_bytes(csma_seed, ARRAY_SIZE(csma_seed));
  	rc = at86rf230_write_subreg(lp, SR_CSMA_SEED_0, csma_seed[0]);
  	if (rc)
-@@ -1346,6 +1331,45 @@
+@@ -1346,6 +1422,45 @@
  	usleep_range(lp->data->t_sleep_cycle,
  		     lp->data->t_sleep_cycle + 100);
  
@@ -1602,7 +1718,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	rc = at86rf230_read_subreg(lp, SR_DVDD_OK, &dvdd);
  	if (rc)
  		return rc;
-@@ -1354,27 +1378,37 @@
+@@ -1354,27 +1469,37 @@
  		return -EINVAL;
  	}
  
@@ -1654,7 +1770,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  }
  
  static int
-@@ -1399,7 +1433,7 @@
+@@ -1399,7 +1524,7 @@
  	if (rc)
  		return rc;
  
@@ -1663,14 +1779,14 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	if (rc)
  		return rc;
  
-@@ -1409,42 +1443,72 @@
+@@ -1409,42 +1534,72 @@
  		return -EINVAL;
  	}
  
 -	lp->dev->extra_tx_headroom = 0;
 -	lp->dev->flags = IEEE802154_HW_OMIT_CKSUM | IEEE802154_HW_AACK |
 -			 IEEE802154_HW_TXPOWER | IEEE802154_HW_CSMA;
-+	lp->hw->flags = IEEE802154_HW_TX_OMIT_CKSUM | IEEE802154_HW_AACK |
++	lp->hw->flags = IEEE802154_HW_TX_OMIT_CKSUM |
 +			IEEE802154_HW_CSMA_PARAMS |
 +			IEEE802154_HW_FRAME_RETRIES | IEEE802154_HW_AFILT |
 +			IEEE802154_HW_PROMISCUOUS;
@@ -1752,7 +1868,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	dev_info(&lp->spi->dev, "Detected %s chip version %d\n", chip, version);
  
  	return rc;
-@@ -1454,77 +1518,92 @@
+@@ -1454,77 +1609,91 @@
  at86rf230_setup_spi_messages(struct at86rf230_local *lp)
  {
  	lp->state.lp = lp;
@@ -1859,12 +1975,11 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
 -	dev->parent = &spi->dev;
 +	lp->slp_tr = slp_tr;
 +	hw->parent = &spi->dev;
-+	hw->vif_data_size = sizeof(*lp);
 +	ieee802154_random_extended_addr(&hw->phy->perm_extended_addr);
  
  	lp->regmap = devm_regmap_init_spi(spi, &at86rf230_regmap_spi_config);
  	if (IS_ERR(lp->regmap)) {
-@@ -1540,13 +1619,11 @@
+@@ -1540,13 +1709,11 @@
  	if (rc < 0)
  		goto free_dev;
  
@@ -1879,11 +1994,25 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	if (rc)
  		goto free_dev;
  
-@@ -1564,14 +1641,14 @@
+@@ -1557,21 +1724,27 @@
+ 
+ 	irq_type = irq_get_trigger_type(spi->irq);
+ 	if (!irq_type)
+-		irq_type = IRQF_TRIGGER_RISING;
++		irq_type = IRQF_TRIGGER_HIGH;
+ 
+ 	rc = devm_request_irq(&spi->dev, spi->irq, at86rf230_isr,
+ 			      IRQF_SHARED | irq_type, dev_name(&spi->dev), lp);
  	if (rc)
  		goto free_dev;
  
 -	rc = ieee802154_register_device(lp->dev);
++	/* disable_irq by default and wait for starting hardware */
++	disable_irq(spi->irq);
++
++	/* going into sleep by default */
++	at86rf230_sleep(lp);
++
 +	rc = ieee802154_register_hw(lp->hw);
  	if (rc)
  		goto free_dev;
@@ -1896,7 +2025,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  
  	return rc;
  }
-@@ -1582,8 +1659,8 @@
+@@ -1582,8 +1755,8 @@
  
  	/* mask all at86rf230 irq's */
  	at86rf230_write_subreg(lp, SR_IRQ_MASK, 0);
@@ -1909,7 +2038,7 @@ diff -urN a/drivers/net/ieee802154/at86rf230.c b/drivers/net/ieee802154/at86rf23
  	return 0;
 diff -urN a/drivers/net/ieee802154/at86rf230.h b/drivers/net/ieee802154/at86rf230.h
 --- a/drivers/net/ieee802154/at86rf230.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/drivers/net/ieee802154/at86rf230.h	2015-06-03 16:51:05.375929118 +1200
++++ b/drivers/net/ieee802154/at86rf230.h	2015-07-09 11:34:32.165173408 +1200
 @@ -0,0 +1,220 @@
 +/*
 + * AT86RF230/RF231 driver
@@ -2133,8 +2262,8 @@ diff -urN a/drivers/net/ieee802154/at86rf230.h b/drivers/net/ieee802154/at86rf23
 +#endif /* !_AT86RF230_H */
 diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 --- a/drivers/net/ieee802154/atusb.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/drivers/net/ieee802154/atusb.c	2015-06-03 16:51:05.375929118 +1200
-@@ -0,0 +1,699 @@
++++ b/drivers/net/ieee802154/atusb.c	2015-07-09 11:34:32.165173408 +1200
+@@ -0,0 +1,762 @@
 +/*
 + * atusb.c - Driver for the ATUSB IEEE 802.15.4 dongle
 + *
@@ -2195,17 +2324,6 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +	uint8_t tx_ack_seq;		/* current TX ACK sequence number */
 +};
 +
-+/* at86rf230.h defines values as <reg, mask, shift> tuples. We use the more
-+ * traditional style of having registers and or-able values. SR_REG extracts
-+ * the register number. SR_VALUE uses the shift to prepare a value accordingly.
-+ */
-+
-+#define __SR_REG(reg, mask, shift)	(reg)
-+#define SR_REG(sr)			__SR_REG(sr)
-+
-+#define __SR_VALUE(reg, mask, shift, val)	((val) << (shift))
-+#define SR_VALUE(sr, val)			__SR_VALUE(sr, (val))
-+
 +/* ----- USB commands without data ----------------------------------------- */
 +
 +/* To reduce the number of error checks in the code, we record the first error
@@ -2265,6 +2383,30 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +				ATUSB_REG_READ, ATUSB_REQ_FROM_DEV,
 +				0, reg, &value, 1, 1000);
 +	return ret >= 0 ? value : ret;
++}
++
++static int atusb_write_subreg(struct atusb *atusb, uint8_t reg, uint8_t mask,
++			      uint8_t shift, uint8_t value)
++{
++	struct usb_device *usb_dev = atusb->usb_dev;
++	uint8_t orig, tmp;
++	int ret = 0;
++
++	dev_dbg(&usb_dev->dev, "atusb_write_subreg: 0x%02x <- 0x%02x\n",
++		reg, value);
++
++	orig = atusb_read_reg(atusb, reg);
++
++	/* Write the value only into that part of the register which is allowed
++	 * by the mask. All other bits stay as before.
++	 */
++	tmp = orig & ~mask;
++	tmp |= (value << shift) & mask;
++
++	if (tmp != orig)
++		ret = atusb_write_reg(atusb, reg, tmp);
++
++	return ret;
 +}
 +
 +static int atusb_get_and_clear_error(struct atusb *atusb)
@@ -2513,7 +2655,6 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +{
 +	struct atusb *atusb = hw->priv;
 +	struct device *dev = &atusb->usb_dev->dev;
-+	uint8_t reg;
 +
 +	if (changed & IEEE802154_AFILT_SADDR_CHANGED) {
 +		u16 addr = le16_to_cpu(filt->short_addr);
@@ -2543,12 +2684,10 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +	if (changed & IEEE802154_AFILT_PANC_CHANGED) {
 +		dev_vdbg(dev,
 +			 "atusb_set_hw_addr_filt called for panc change\n");
-+		reg = atusb_read_reg(atusb, SR_REG(SR_AACK_I_AM_COORD));
 +		if (filt->pan_coord)
-+			reg |= SR_VALUE(SR_AACK_I_AM_COORD, 1);
++			atusb_write_subreg(atusb, SR_AACK_I_AM_COORD, 1);
 +		else
-+			reg &= ~SR_VALUE(SR_AACK_I_AM_COORD, 1);
-+		atusb_write_reg(atusb, SR_REG(SR_AACK_I_AM_COORD), reg);
++			atusb_write_subreg(atusb, SR_AACK_I_AM_COORD, 0);
 +	}
 +
 +	return atusb_get_and_clear_error(atusb);
@@ -2580,6 +2719,53 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +	atusb_get_and_clear_error(atusb);
 +}
 +
++#define ATUSB_MAX_TX_POWERS 0xF
++static const s32 atusb_powers[ATUSB_MAX_TX_POWERS + 1] = {
++	300, 280, 230, 180, 130, 70, 0, -100, -200, -300, -400, -500, -700,
++	-900, -1200, -1700,
++};
++
++static int
++atusb_set_txpower(struct ieee802154_hw *hw, s32 mbm)
++{
++	struct atusb *atusb = hw->priv;
++	u32 i;
++
++	for (i = 0; i < hw->phy->supported.tx_powers_size; i++) {
++		if (hw->phy->supported.tx_powers[i] == mbm)
++			return atusb_write_subreg(atusb, SR_TX_PWR_23X, i);
++	}
++
++	return -EINVAL;
++}
++
++static int
++atusb_set_promiscuous_mode(struct ieee802154_hw *hw, const bool on)
++{
++	struct atusb *atusb = hw->priv;
++	int ret;
++
++	if (on) {
++		ret = atusb_write_subreg(atusb, SR_AACK_DIS_ACK, 1);
++		if (ret < 0)
++			return ret;
++
++		ret = atusb_write_subreg(atusb, SR_AACK_PROM_MODE, 1);
++		if (ret < 0)
++			return ret;
++	} else {
++		ret = atusb_write_subreg(atusb, SR_AACK_PROM_MODE, 0);
++		if (ret < 0)
++			return ret;
++
++		ret = atusb_write_subreg(atusb, SR_AACK_DIS_ACK, 0);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
 +static struct ieee802154_ops atusb_ops = {
 +	.owner			= THIS_MODULE,
 +	.xmit_async		= atusb_xmit,
@@ -2588,6 +2774,8 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +	.start			= atusb_start,
 +	.stop			= atusb_stop,
 +	.set_hw_addr_filt	= atusb_set_hw_addr_filt,
++	.set_txpower		= atusb_set_txpower,
++	.set_promiscuous_mode	= atusb_set_promiscuous_mode,
 +};
 +
 +/* ----- Firmware and chip version information ----------------------------- */
@@ -2706,11 +2894,16 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +
 +	hw->parent = &usb_dev->dev;
 +	hw->flags = IEEE802154_HW_TX_OMIT_CKSUM | IEEE802154_HW_AFILT |
-+		    IEEE802154_HW_AACK;
++		    IEEE802154_HW_PROMISCUOUS;
++
++	hw->phy->flags = WPAN_PHY_FLAG_TXPOWER;
 +
 +	hw->phy->current_page = 0;
 +	hw->phy->current_channel = 11;	/* reset default */
 +	hw->phy->supported.channels[0] = 0x7FFF800;
++	hw->phy->supported.tx_powers = atusb_powers;
++	hw->phy->supported.tx_powers_size = ARRAY_SIZE(atusb_powers);
++	hw->phy->transmit_power = hw->phy->supported.tx_powers[0];
 +	ieee802154_random_extended_addr(&hw->phy->perm_extended_addr);
 +
 +	atusb_command(atusb, ATUSB_RF_RESET, 0);
@@ -2759,8 +2952,7 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +	 *     http://www.jennic.com/download_file.php?supportFile=JN-AN-1035%20Calculating%20802-15-4%20Data%20Rates-1v0.pdf
 +	 */
 +
-+	atusb_write_reg(atusb,
-+			SR_REG(SR_RX_SAFE_MODE), SR_VALUE(SR_RX_SAFE_MODE, 1));
++	atusb_write_subreg(atusb, SR_RX_SAFE_MODE, 1);
 +#endif
 +	atusb_write_reg(atusb, RG_IRQ_MASK, 0xff);
 +
@@ -2836,7 +3028,7 @@ diff -urN a/drivers/net/ieee802154/atusb.c b/drivers/net/ieee802154/atusb.c
 +MODULE_LICENSE("GPL");
 diff -urN a/drivers/net/ieee802154/atusb.h b/drivers/net/ieee802154/atusb.h
 --- a/drivers/net/ieee802154/atusb.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/drivers/net/ieee802154/atusb.h	2015-06-03 16:51:05.379929118 +1200
++++ b/drivers/net/ieee802154/atusb.h	2015-07-09 11:34:32.169175407 +1200
 @@ -0,0 +1,84 @@
 +/*
 + * atusb.h - Definitions shared between kernel and ATUSB firmware
@@ -2923,8 +3115,8 @@ diff -urN a/drivers/net/ieee802154/atusb.h b/drivers/net/ieee802154/atusb.h
 +
 +#endif /* !_ATUSB_H */
 diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
---- a/drivers/net/ieee802154/cc2520.c	2015-06-03 16:51:05.039929126 +1200
-+++ b/drivers/net/ieee802154/cc2520.c	2015-06-03 16:51:05.383929118 +1200
+--- a/drivers/net/ieee802154/cc2520.c	2015-07-09 11:34:31.676929412 +1200
++++ b/drivers/net/ieee802154/cc2520.c	2015-07-09 11:34:32.169175407 +1200
 @@ -19,12 +19,11 @@
  #include <linux/workqueue.h>
  #include <linux/interrupt.h>
@@ -2953,7 +3145,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  
  /* IEEE-802.15.4 defined constants (2.4 GHz logical channels) */
  #define	CC2520_MINCHANNEL		11
-@@ -193,7 +192,7 @@
+@@ -193,10 +192,11 @@
  /* Driver private information */
  struct cc2520_private {
  	struct spi_device *spi;		/* SPI device structure */
@@ -2962,7 +3154,11 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	u8 *buf;			/* SPI TX/Rx data buffer */
  	struct mutex buffer_mutex;	/* SPI buffer mutex */
  	bool is_tx;			/* Flag for sync b/w Tx and Rx */
-@@ -453,20 +452,20 @@
++	bool amplified;			/* Flag for CC2591 */
+ 	int fifo_pin;			/* FIFO GPIO pin number */
+ 	struct work_struct fifop_irqwork;/* Workqueue for FIFOP */
+ 	spinlock_t lock;		/* Lock for is_tx*/
+@@ -453,20 +453,20 @@
  	return status;
  }
  
@@ -2989,7 +3185,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	unsigned long flags;
  	int rc;
  	u8 status = 0;
-@@ -513,7 +512,6 @@
+@@ -513,7 +513,6 @@
  	return rc;
  }
  
@@ -2997,7 +3193,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  static int cc2520_rx(struct cc2520_private *priv)
  {
  	u8 len = 0, lqi = 0, bytes = 1;
-@@ -524,7 +522,7 @@
+@@ -524,7 +523,7 @@
  	if (len < 2 || len > IEEE802154_MTU)
  		return -EINVAL;
  
@@ -3006,7 +3202,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	if (!skb)
  		return -ENOMEM;
  
-@@ -536,7 +534,7 @@
+@@ -536,7 +535,7 @@
  
  	skb_trim(skb, skb->len - 2);
  
@@ -3015,7 +3211,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  
  	dev_vdbg(&priv->spi->dev, "RXFIFO: %x %x\n", len, lqi);
  
-@@ -544,21 +542,21 @@
+@@ -544,21 +543,21 @@
  }
  
  static int
@@ -3041,7 +3237,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	if (ret)
  		return ret;
  
-@@ -569,12 +567,11 @@
+@@ -569,12 +568,11 @@
  }
  
  static int
@@ -3056,7 +3252,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	dev_dbg(&priv->spi->dev, "trying to set channel\n");
  
  	BUG_ON(page != 0);
-@@ -588,12 +585,12 @@
+@@ -588,84 +586,194 @@
  }
  
  static int
@@ -3066,23 +3262,30 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  {
 -	struct cc2520_private *priv = dev->priv;
 +	struct cc2520_private *priv = hw->priv;
++	int ret = 0;
  
 -	if (changed & IEEE802515_AFILT_PANID_CHANGED) {
 +	if (changed & IEEE802154_AFILT_PANID_CHANGED) {
  		u16 panid = le16_to_cpu(filt->pan_id);
  
  		dev_vdbg(&priv->spi->dev,
-@@ -602,7 +599,7 @@
- 				 sizeof(panid), (u8 *)&panid);
+ 			 "cc2520_filter called for pan id\n");
+-		cc2520_write_ram(priv, CC2520RAM_PANID,
+-				 sizeof(panid), (u8 *)&panid);
++		ret = cc2520_write_ram(priv, CC2520RAM_PANID,
++				       sizeof(panid), (u8 *)&panid);
  	}
  
 -	if (changed & IEEE802515_AFILT_IEEEADDR_CHANGED) {
 +	if (changed & IEEE802154_AFILT_IEEEADDR_CHANGED) {
  		dev_vdbg(&priv->spi->dev,
  			 "cc2520_filter called for IEEE addr\n");
- 		cc2520_write_ram(priv, CC2520RAM_IEEEADDR,
-@@ -610,7 +607,7 @@
- 				 (u8 *)&filt->ieee_addr);
+-		cc2520_write_ram(priv, CC2520RAM_IEEEADDR,
+-				 sizeof(filt->ieee_addr),
+-				 (u8 *)&filt->ieee_addr);
++		ret = cc2520_write_ram(priv, CC2520RAM_IEEEADDR,
++				       sizeof(filt->ieee_addr),
++				       (u8 *)&filt->ieee_addr);
  	}
  
 -	if (changed & IEEE802515_AFILT_SADDR_CHANGED) {
@@ -3090,8 +3293,11 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  		u16 addr = le16_to_cpu(filt->short_addr);
  
  		dev_vdbg(&priv->spi->dev,
-@@ -619,7 +616,7 @@
- 				 sizeof(addr), (u8 *)&addr);
+ 			 "cc2520_filter called for saddr\n");
+-		cc2520_write_ram(priv, CC2520RAM_SHORTADDR,
+-				 sizeof(addr), (u8 *)&addr);
++		ret = cc2520_write_ram(priv, CC2520RAM_SHORTADDR,
++				       sizeof(addr), (u8 *)&addr);
  	}
  
 -	if (changed & IEEE802515_AFILT_PANC_CHANGED) {
@@ -3099,8 +3305,108 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  		dev_vdbg(&priv->spi->dev,
  			 "cc2520_filter called for panc change\n");
  		if (filt->pan_coord)
-@@ -631,11 +628,11 @@
- 	return 0;
+-			cc2520_write_register(priv, CC2520_FRMFILT0, 0x02);
++			ret = cc2520_write_register(priv, CC2520_FRMFILT0,
++						    0x02);
+ 		else
+-			cc2520_write_register(priv, CC2520_FRMFILT0, 0x00);
++			ret = cc2520_write_register(priv, CC2520_FRMFILT0,
++						    0x00);
+ 	}
+ 
+-	return 0;
++	return ret;
++}
++
++static inline int cc2520_set_tx_power(struct cc2520_private *priv, s32 mbm)
++{
++	u8 power;
++
++	switch (mbm) {
++	case 500:
++		power = 0xF7;
++		break;
++	case 300:
++		power = 0xF2;
++		break;
++	case 200:
++		power = 0xAB;
++		break;
++	case 100:
++		power = 0x13;
++		break;
++	case 0:
++		power = 0x32;
++		break;
++	case -200:
++		power = 0x81;
++		break;
++	case -400:
++		power = 0x88;
++		break;
++	case -700:
++		power = 0x2C;
++		break;
++	case -1800:
++		power = 0x03;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return cc2520_write_register(priv, CC2520_TXPOWER, power);
++}
++
++static inline int cc2520_cc2591_set_tx_power(struct cc2520_private *priv,
++					     s32 mbm)
++{
++	u8 power;
++
++	switch (mbm) {
++	case 1700:
++		power = 0xF9;
++		break;
++	case 1600:
++		power = 0xF0;
++		break;
++	case 1400:
++		power = 0xA0;
++		break;
++	case 1100:
++		power = 0x2C;
++		break;
++	case -100:
++		power = 0x03;
++		break;
++	case -800:
++		power = 0x01;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return cc2520_write_register(priv, CC2520_TXPOWER, power);
++}
++
++#define CC2520_MAX_TX_POWERS 0x8
++static const s32 cc2520_powers[CC2520_MAX_TX_POWERS + 1] = {
++	500, 300, 200, 100, 0, -200, -400, -700, -1800,
++};
++
++#define CC2520_CC2591_MAX_TX_POWERS 0x5
++static const s32 cc2520_cc2591_powers[CC2520_CC2591_MAX_TX_POWERS + 1] = {
++	1700, 1600, 1400, 1100, -100, -800,
++};
++
++static int
++cc2520_set_txpower(struct ieee802154_hw *hw, s32 mbm)
++{
++	struct cc2520_private *priv = hw->priv;
++
++	if (!priv->amplified)
++		return cc2520_set_tx_power(priv, mbm);
++
++	return cc2520_cc2591_set_tx_power(priv, mbm);
  }
  
 -static struct ieee802154_ops cc2520_ops = {
@@ -3113,7 +3419,10 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	.ed = cc2520_ed,
  	.set_channel = cc2520_set_channel,
  	.set_hw_addr_filt = cc2520_filter,
-@@ -645,27 +642,30 @@
++	.set_txpower = cc2520_set_txpower,
+ };
+ 
+ static int cc2520_register(struct cc2520_private *priv)
  {
  	int ret = -ENOMEM;
  
@@ -3129,15 +3438,27 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
 +	priv->hw->priv = priv;
 +	priv->hw->parent = &priv->spi->dev;
 +	priv->hw->extra_tx_headroom = 0;
-+	priv->hw->vif_data_size = sizeof(*priv);
 +	ieee802154_random_extended_addr(&priv->hw->phy->perm_extended_addr);
  
  	/* We do support only 2.4 Ghz */
 -	priv->dev->phy->channels_supported[0] = 0x7FFF800;
 -	priv->dev->flags = IEEE802154_HW_OMIT_CKSUM | IEEE802154_HW_AACK;
 +	priv->hw->phy->supported.channels[0] = 0x7FFF800;
-+	priv->hw->flags = IEEE802154_HW_OMIT_CKSUM | IEEE802154_HW_AACK |
-+			  IEEE802154_HW_AFILT;
++	priv->hw->flags = IEEE802154_HW_OMIT_CKSUM | IEEE802154_HW_AFILT;
++
++	priv->hw->phy->flags = WPAN_PHY_FLAG_TXPOWER;
++
++	if (!priv->amplified) {
++		priv->hw->phy->supported.tx_powers = cc2520_powers;
++		priv->hw->phy->supported.tx_powers_size = ARRAY_SIZE(cc2520_powers);
++		priv->hw->phy->transmit_power = priv->hw->phy->supported.tx_powers[4];
++	} else {
++		priv->hw->phy->supported.tx_powers = cc2520_cc2591_powers;
++		priv->hw->phy->supported.tx_powers_size = ARRAY_SIZE(cc2520_cc2591_powers);
++		priv->hw->phy->transmit_power = priv->hw->phy->supported.tx_powers[0];
++	}
++
++	priv->hw->phy->current_channel = 11;
  
  	dev_vdbg(&priv->spi->dev, "registered cc2520\n");
 -	ret = ieee802154_register_device(priv->dev);
@@ -3153,7 +3474,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  err_ret:
  	return ret;
  }
-@@ -714,11 +714,45 @@
+@@ -714,11 +822,47 @@
  	return IRQ_HANDLED;
  }
  
@@ -3181,7 +3502,9 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
 +	pdata->vreg = of_get_named_gpio(np, "vreg-gpio", 0);
 +	pdata->reset = of_get_named_gpio(np, "reset-gpio", 0);
 +
-+	pdata->amplified = of_property_read_bool(np, "amplified");
++	/* CC2591 front end for CC2520 */
++	if (of_property_read_bool(np, "amplified"))
++		priv->amplified = true;
 +
 +	return 0;
 +}
@@ -3199,7 +3522,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  
  	ret = cc2520_read_register(priv, CC2520_FSMSTAT1, &state);
  	if (ret)
-@@ -741,11 +775,47 @@
+@@ -741,11 +885,39 @@
  
  	dev_vdbg(&priv->spi->dev, "oscillator brought up\n");
  
@@ -3213,15 +3536,11 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
 +	 * amplifier. See section 8 page 17 of TI application note AN065.
 +	 * http://www.ti.com/lit/an/swra229a/swra229a.pdf
 +	 */
-+	if (pdata.amplified) {
-+		ret = cc2520_write_register(priv, CC2520_TXPOWER, 0xF9);
-+		if (ret)
-+			goto err_ret;
-+
++	if (priv->amplified) {
 +		ret = cc2520_write_register(priv, CC2520_AGCCTRL1, 0x16);
 +		if (ret)
 +			goto err_ret;
- 
++
 +		ret = cc2520_write_register(priv, CC2520_GPIOCTRL0, 0x46);
 +		if (ret)
 +			goto err_ret;
@@ -3233,15 +3552,11 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
 +		ret = cc2520_write_register(priv, CC2520_GPIOPOLARITY, 0x1e);
 +		if (ret)
 +			goto err_ret;
-+
+ 
 +		ret = cc2520_write_register(priv, CC2520_TXCTRL, 0xc1);
 +		if (ret)
 +			goto err_ret;
 +	} else {
-+		ret = cc2520_write_register(priv, CC2520_TXPOWER, 0xF7);
-+		if (ret)
-+			goto err_ret;
-+
 +		ret = cc2520_write_register(priv, CC2520_AGCCTRL1, 0x11);
 +		if (ret)
 +			goto err_ret;
@@ -3251,7 +3566,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	ret = cc2520_write_register(priv, CC2520_CCACTRL0, 0x1A);
  	if (ret)
  		goto err_ret;
-@@ -770,10 +840,6 @@
+@@ -770,10 +942,6 @@
  	if (ret)
  		goto err_ret;
  
@@ -3262,7 +3577,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	ret = cc2520_write_register(priv, CC2520_ADCTEST0, 0x10);
  	if (ret)
  		goto err_ret;
-@@ -808,59 +874,20 @@
+@@ -808,59 +976,20 @@
  	return ret;
  }
  
@@ -3328,7 +3643,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  		dev_err(&spi->dev, "no platform data\n");
  		return -EINVAL;
  	}
-@@ -869,10 +896,8 @@
+@@ -869,88 +998,88 @@
  
  	priv->buf = devm_kzalloc(&spi->dev,
  				 SPI_COMMAND_BUFFER, GFP_KERNEL);
@@ -3341,9 +3656,12 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  
  	mutex_init(&priv->buffer_mutex);
  	INIT_WORK(&priv->fifop_irqwork, cc2520_fifop_irqwork);
-@@ -880,77 +905,76 @@
+ 	spin_lock_init(&priv->lock);
  	init_completion(&priv->tx_complete);
  
++	/* Assumption that CC2591 is not connected */
++	priv->amplified = false;
++
  	/* Request all the gpio's */
 -	if (!gpio_is_valid(pdata->fifo)) {
 +	if (!gpio_is_valid(pdata.fifo)) {
@@ -3433,7 +3751,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	usleep_range(200, 250);
  
  	ret = cc2520_hw_init(priv);
-@@ -959,7 +983,7 @@
+@@ -959,7 +1088,7 @@
  
  	/* Set up fifop interrupt */
  	ret = devm_request_irq(&spi->dev,
@@ -3442,7 +3760,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  			       cc2520_fifop_isr,
  			       IRQF_TRIGGER_RISING,
  			       dev_name(&spi->dev),
-@@ -971,7 +995,7 @@
+@@ -971,7 +1100,7 @@
  
  	/* Set up sfd interrupt */
  	ret = devm_request_irq(&spi->dev,
@@ -3451,7 +3769,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  			       cc2520_sfd_isr,
  			       IRQF_TRIGGER_FALLING,
  			       dev_name(&spi->dev),
-@@ -990,8 +1014,6 @@
+@@ -990,8 +1119,6 @@
  err_hw_init:
  	mutex_destroy(&priv->buffer_mutex);
  	flush_work(&priv->fifop_irqwork);
@@ -3460,7 +3778,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	return ret;
  }
  
-@@ -1002,8 +1024,8 @@
+@@ -1002,8 +1129,8 @@
  	mutex_destroy(&priv->buffer_mutex);
  	flush_work(&priv->fifop_irqwork);
  
@@ -3472,7 +3790,7 @@ diff -urN a/drivers/net/ieee802154/cc2520.c b/drivers/net/ieee802154/cc2520.c
  	return 0;
  }
 diff -urN a/drivers/net/ieee802154/fakehard.c b/drivers/net/ieee802154/fakehard.c
---- a/drivers/net/ieee802154/fakehard.c	2015-06-03 16:51:05.043929126 +1200
+--- a/drivers/net/ieee802154/fakehard.c	2015-07-09 11:34:31.684933413 +1200
 +++ b/drivers/net/ieee802154/fakehard.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,430 +0,0 @@
 -/*
@@ -3906,8 +4224,8 @@ diff -urN a/drivers/net/ieee802154/fakehard.c b/drivers/net/ieee802154/fakehard.
 -module_exit(fake_exit);
 -MODULE_LICENSE("GPL");
 diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
---- a/drivers/net/ieee802154/fakelb.c	2015-06-03 16:51:05.047929126 +1200
-+++ b/drivers/net/ieee802154/fakelb.c	2015-06-03 16:51:05.391929118 +1200
+--- a/drivers/net/ieee802154/fakelb.c	2015-07-09 11:34:31.688935413 +1200
++++ b/drivers/net/ieee802154/fakelb.c	2015-07-09 11:34:32.173177407 +1200
 @@ -12,10 +12,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -3919,7 +4237,7 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
   * Written by:
   * Sergey Lapin <slapin@ossfans.org>
   * Dmitry Eremin-Solenikov <dbaryshkov@gmail.com>
-@@ -29,113 +25,91 @@
+@@ -29,113 +25,96 @@
  #include <linux/device.h>
  #include <linux/spinlock.h>
  #include <net/mac802154.h>
@@ -3947,6 +4265,8 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
 +
 +	u8 page;
 +	u8 channel;
++
++	bool suspended;
  
 -struct fakelb_priv {
  	struct list_head list;
@@ -3988,8 +4308,7 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
 +static int fakelb_hw_xmit(struct ieee802154_hw *hw, struct sk_buff *skb)
  {
 -	struct sk_buff *newskb;
-+	struct fakelb_phy *current_phy = hw->priv, *phy;
- 
+-
 -	spin_lock(&priv->lock);
 -	if (priv->working) {
 -		newskb = pskb_copy(skb, GFP_ATOMIC);
@@ -3997,13 +4316,15 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
 -	}
 -	spin_unlock(&priv->lock);
 -}
--
++	struct fakelb_phy *current_phy = hw->priv, *phy;
+ 
 -static int
 -fakelb_hw_xmit(struct ieee802154_dev *dev, struct sk_buff *skb)
 -{
 -	struct fakelb_dev_priv *priv = dev->priv;
 -	struct fakelb_priv *fake = priv->fake;
 +	read_lock_bh(&fakelb_ifup_phys_lock);
++	WARN_ON(current_phy->suspended);
 +	list_for_each_entry(phy, &fakelb_ifup_phys, list_ifup) {
 +		if (current_phy == phy)
 +			continue;
@@ -4051,6 +4372,7 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
 +	struct fakelb_phy *phy = hw->priv;
 +
 +	write_lock_bh(&fakelb_ifup_phys_lock);
++	phy->suspended = false;
 +	list_add(&phy->list_ifup, &fakelb_ifup_phys);
 +	write_unlock_bh(&fakelb_ifup_phys_lock);
  
@@ -4070,6 +4392,7 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
 +	struct fakelb_phy *phy = hw->priv;
 +
 +	write_lock_bh(&fakelb_ifup_phys_lock);
++	phy->suspended = true;
 +	list_del(&phy->list_ifup);
 +	write_unlock_bh(&fakelb_ifup_phys_lock);
  }
@@ -4082,7 +4405,7 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
  	.ed = fakelb_hw_ed,
  	.set_channel = fakelb_hw_channel,
  	.start = fakelb_hw_start,
-@@ -146,122 +120,110 @@
+@@ -146,122 +125,110 @@
  module_param(numlbs, int, 0);
  MODULE_PARM_DESC(numlbs, " number of pseudo devices");
  
@@ -4253,7 +4576,7 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
  	return 0;
  }
  
-@@ -272,7 +234,6 @@
+@@ -272,7 +239,6 @@
  	.remove = fakelb_remove,
  	.driver = {
  			.name = "ieee802154fakelb",
@@ -4262,8 +4585,8 @@ diff -urN a/drivers/net/ieee802154/fakelb.c b/drivers/net/ieee802154/fakelb.c
  };
  
 diff -urN a/drivers/net/ieee802154/Kconfig b/drivers/net/ieee802154/Kconfig
---- a/drivers/net/ieee802154/Kconfig	2015-06-03 16:51:05.055929126 +1200
-+++ b/drivers/net/ieee802154/Kconfig	2015-06-03 16:51:05.391929118 +1200
+--- a/drivers/net/ieee802154/Kconfig	2015-07-09 11:34:31.708945413 +1200
++++ b/drivers/net/ieee802154/Kconfig	2015-07-09 11:34:32.177179407 +1200
 @@ -10,16 +10,6 @@
  	  If you say N, all options in this submenu will be skipped and
  	  disabled.
@@ -4296,8 +4619,8 @@ diff -urN a/drivers/net/ieee802154/Kconfig b/drivers/net/ieee802154/Kconfig
 +	  This driver can also be built as a module. To do so say M here.
 +	  The module will be called 'atusb'.
 diff -urN a/drivers/net/ieee802154/Makefile b/drivers/net/ieee802154/Makefile
---- a/drivers/net/ieee802154/Makefile	2015-06-03 16:51:05.055929126 +1200
-+++ b/drivers/net/ieee802154/Makefile	2015-06-03 16:51:05.395929118 +1200
+--- a/drivers/net/ieee802154/Makefile	2015-07-09 11:34:31.716949413 +1200
++++ b/drivers/net/ieee802154/Makefile	2015-07-09 11:34:32.177179407 +1200
 @@ -1,5 +1,5 @@
 -obj-$(CONFIG_IEEE802154_FAKEHARD) += fakehard.o
  obj-$(CONFIG_IEEE802154_FAKELB) += fakelb.o
@@ -4306,8 +4629,8 @@ diff -urN a/drivers/net/ieee802154/Makefile b/drivers/net/ieee802154/Makefile
  obj-$(CONFIG_IEEE802154_CC2520) += cc2520.o
 +obj-$(CONFIG_IEEE802154_ATUSB) += atusb.o
 diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.c
---- a/drivers/net/ieee802154/mrf24j40.c	2015-06-03 16:51:05.063929126 +1200
-+++ b/drivers/net/ieee802154/mrf24j40.c	2015-06-03 16:51:05.399929118 +1200
+--- a/drivers/net/ieee802154/mrf24j40.c	2015-07-09 11:34:31.720951413 +1200
++++ b/drivers/net/ieee802154/mrf24j40.c	2015-07-09 11:34:32.181181407 +1200
 @@ -13,18 +13,14 @@
   * but WITHOUT ANY WARRANTY; without even the implied warranty of
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
@@ -4491,7 +4814,15 @@ diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.
  	}
  
  	return 0;
-@@ -543,7 +543,7 @@
+@@ -533,6 +533,7 @@
+ 	u8 lqi = 0;
+ 	u8 val;
+ 	int ret = 0;
++	int ret2;
+ 	struct sk_buff *skb;
+ 
+ 	/* Turn off reception of packets off the air. This prevents the
+@@ -543,7 +544,7 @@
  	val |= 4; /* SET RXDECINV */
  	write_short_reg(devrec, REG_BBREG1, val);
  
@@ -4500,7 +4831,7 @@ diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.
  	if (!skb) {
  		ret = -ENOMEM;
  		goto out;
-@@ -563,7 +563,7 @@
+@@ -563,24 +564,24 @@
  	/* TODO: Other drivers call ieee20154_rx_irqsafe() here (eg: cc2040,
  	 * also from a workqueue).  I think irqsafe is not necessary here.
  	 * Can someone confirm? */
@@ -4509,7 +4840,17 @@ diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.
  
  	dev_dbg(printdev(devrec), "RX Handled\n");
  
-@@ -578,9 +578,9 @@
+ out:
+ 	/* Turn back on reception of packets off the air. */
+-	ret = read_short_reg(devrec, REG_BBREG1, &val);
+-	if (ret)
+-		return ret;
++	ret2 = read_short_reg(devrec, REG_BBREG1, &val);
++	if (ret2)
++		return ret2;
+ 	val &= ~0x4; /* Clear RXDECINV */
+ 	write_short_reg(devrec, REG_BBREG1, val);
+ 
  	return ret;
  }
  
@@ -4521,7 +4862,7 @@ diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.
  	.ed = mrf24j40_ed,
  	.start = mrf24j40_start,
  	.stop = mrf24j40_stop,
-@@ -691,6 +691,28 @@
+@@ -691,6 +692,28 @@
  	if (ret)
  		goto err_ret;
  
@@ -4550,7 +4891,7 @@ diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.
  	return 0;
  
  err_ret:
-@@ -722,17 +744,18 @@
+@@ -722,17 +745,17 @@
  
  	/* Register with the 802154 subsystem */
  
@@ -4567,8 +4908,7 @@ diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.
 +	devrec->hw->priv = devrec;
 +	devrec->hw->parent = &devrec->spi->dev;
 +	devrec->hw->phy->supported.channels[0] = CHANNEL_MASK;
-+	devrec->hw->flags = IEEE802154_HW_OMIT_CKSUM | IEEE802154_HW_AACK |
-+			    IEEE802154_HW_AFILT;
++	devrec->hw->flags = IEEE802154_HW_OMIT_CKSUM | IEEE802154_HW_AFILT;
  
  	dev_dbg(printdev(devrec), "registered mrf24j40\n");
 -	ret = ieee802154_register_device(devrec->dev);
@@ -4613,7 +4953,7 @@ diff -urN a/drivers/net/ieee802154/mrf24j40.c b/drivers/net/ieee802154/mrf24j40.
  MODULE_DEVICE_TABLE(spi, mrf24j40_ids);
 diff -urN a/include/linux/ieee802154.h b/include/linux/ieee802154.h
 --- a/include/linux/ieee802154.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/include/linux/ieee802154.h	2015-06-03 16:51:05.411929118 +1200
++++ b/include/linux/ieee802154.h	2015-07-09 11:34:32.185183407 +1200
 @@ -0,0 +1,250 @@
 +/*
 + * IEEE802.15.4-2003 specification
@@ -4866,8 +5206,8 @@ diff -urN a/include/linux/ieee802154.h b/include/linux/ieee802154.h
 +
 +#endif /* LINUX_IEEE802154_H */
 diff -urN a/include/linux/spi/at86rf230.h b/include/linux/spi/at86rf230.h
---- a/include/linux/spi/at86rf230.h	2015-06-03 16:51:05.123929124 +1200
-+++ b/include/linux/spi/at86rf230.h	2015-06-03 16:51:05.471929116 +1200
+--- a/include/linux/spi/at86rf230.h	2015-07-09 11:34:31.865023411 +1200
++++ b/include/linux/spi/at86rf230.h	2015-07-09 11:34:32.205193407 +1200
 @@ -12,10 +12,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -4888,8 +5228,8 @@ diff -urN a/include/linux/spi/at86rf230.h b/include/linux/spi/at86rf230.h
  
  #endif
 diff -urN a/include/net/6lowpan.h b/include/net/6lowpan.h
---- a/include/net/6lowpan.h	2015-06-03 16:51:05.079929125 +1200
-+++ b/include/net/6lowpan.h	2015-06-03 16:51:05.419929117 +1200
+--- a/include/net/6lowpan.h	2015-07-09 11:34:31.796989411 +1200
++++ b/include/net/6lowpan.h	2015-07-09 11:34:32.185183407 +1200
 @@ -372,12 +372,12 @@
  	return skb->len + uncomp_header - ret;
  }
@@ -4910,8 +5250,8 @@ diff -urN a/include/net/6lowpan.h b/include/net/6lowpan.h
  			unsigned short type, const void *_daddr,
  			const void *_saddr, unsigned int len);
 diff -urN a/include/net/af_ieee802154.h b/include/net/af_ieee802154.h
---- a/include/net/af_ieee802154.h	2015-06-03 16:51:05.095929125 +1200
-+++ b/include/net/af_ieee802154.h	2015-06-03 16:51:05.423929117 +1200
+--- a/include/net/af_ieee802154.h	2015-07-09 11:34:31.808995412 +1200
++++ b/include/net/af_ieee802154.h	2015-07-09 11:34:32.189185407 +1200
 @@ -12,10 +12,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -4925,8 +5265,8 @@ diff -urN a/include/net/af_ieee802154.h b/include/net/af_ieee802154.h
   * Dmitry Eremin-Solenikov <dbaryshkov@gmail.com>
 diff -urN a/include/net/cfg802154.h b/include/net/cfg802154.h
 --- a/include/net/cfg802154.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/include/net/cfg802154.h	2015-06-03 16:51:05.427929117 +1200
-@@ -0,0 +1,229 @@
++++ b/include/net/cfg802154.h	2015-07-09 11:34:32.193187407 +1200
+@@ -0,0 +1,231 @@
 +/*
 + * Copyright (C) 2007, 2008, 2009 Siemens AG
 + *
@@ -4963,6 +5303,8 @@ diff -urN a/include/net/cfg802154.h b/include/net/cfg802154.h
 +							   int type);
 +	void	(*del_virtual_intf_deprecated)(struct wpan_phy *wpan_phy,
 +					       struct net_device *dev);
++	int	(*suspend)(struct wpan_phy *wpan_phy);
++	int	(*resume)(struct wpan_phy *wpan_phy);
 +	int	(*add_virtual_intf)(struct wpan_phy *wpan_phy,
 +				    const char *name,
 +				    unsigned char name_assign_type,
@@ -5157,7 +5499,7 @@ diff -urN a/include/net/cfg802154.h b/include/net/cfg802154.h
 +
 +#endif /* __NET_CFG802154_H */
 diff -urN a/include/net/ieee802154.h b/include/net/ieee802154.h
---- a/include/net/ieee802154.h	2015-06-03 16:51:05.099929125 +1200
+--- a/include/net/ieee802154.h	2015-07-09 11:34:31.821001412 +1200
 +++ b/include/net/ieee802154.h	1970-01-01 12:00:00.000000000 +1200
 @@ -1,195 +0,0 @@
 -/*
@@ -5356,8 +5698,8 @@ diff -urN a/include/net/ieee802154.h b/include/net/ieee802154.h
 -
 -
 diff -urN a/include/net/ieee802154_netdev.h b/include/net/ieee802154_netdev.h
---- a/include/net/ieee802154_netdev.h	2015-06-03 16:51:05.103929125 +1200
-+++ b/include/net/ieee802154_netdev.h	2015-06-03 16:51:05.431929117 +1200
+--- a/include/net/ieee802154_netdev.h	2015-07-09 11:34:31.829005412 +1200
++++ b/include/net/ieee802154_netdev.h	2015-07-09 11:34:32.197189407 +1200
 @@ -12,10 +12,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -5383,7 +5725,7 @@ diff -urN a/include/net/ieee802154_netdev.h b/include/net/ieee802154_netdev.h
  
  struct ieee802154_sechdr {
  #if defined(__LITTLE_ENDIAN_BITFIELD)
-@@ -341,7 +339,7 @@
+@@ -341,22 +339,22 @@
  	s8 frame_retries;
  
  	bool lbt;
@@ -5392,6 +5734,30 @@ diff -urN a/include/net/ieee802154_netdev.h b/include/net/ieee802154_netdev.h
  	s32 cca_ed_level;
  };
  
+ struct wpan_phy;
+ 
+ enum {
+-	IEEE802154_LLSEC_PARAM_ENABLED = 1 << 0,
+-	IEEE802154_LLSEC_PARAM_FRAME_COUNTER = 1 << 1,
+-	IEEE802154_LLSEC_PARAM_OUT_LEVEL = 1 << 2,
+-	IEEE802154_LLSEC_PARAM_OUT_KEY = 1 << 3,
+-	IEEE802154_LLSEC_PARAM_KEY_SOURCE = 1 << 4,
+-	IEEE802154_LLSEC_PARAM_PAN_ID = 1 << 5,
+-	IEEE802154_LLSEC_PARAM_HWADDR = 1 << 6,
+-	IEEE802154_LLSEC_PARAM_COORD_HWADDR = 1 << 7,
+-	IEEE802154_LLSEC_PARAM_COORD_SHORTADDR = 1 << 8,
++	IEEE802154_LLSEC_PARAM_ENABLED		= BIT(0),
++	IEEE802154_LLSEC_PARAM_FRAME_COUNTER	= BIT(1),
++	IEEE802154_LLSEC_PARAM_OUT_LEVEL	= BIT(2),
++	IEEE802154_LLSEC_PARAM_OUT_KEY		= BIT(3),
++	IEEE802154_LLSEC_PARAM_KEY_SOURCE	= BIT(4),
++	IEEE802154_LLSEC_PARAM_PAN_ID		= BIT(5),
++	IEEE802154_LLSEC_PARAM_HWADDR		= BIT(6),
++	IEEE802154_LLSEC_PARAM_COORD_HWADDR	= BIT(7),
++	IEEE802154_LLSEC_PARAM_COORD_SHORTADDR	= BIT(8),
+ };
+ 
+ struct ieee802154_llsec_ops {
 @@ -424,28 +422,6 @@
  			       struct ieee802154_mac_params *params);
  
@@ -5434,8 +5800,8 @@ diff -urN a/include/net/ieee802154_netdev.h b/include/net/ieee802154_netdev.h
  
  #endif
 diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
---- a/include/net/mac802154.h	2015-06-03 16:51:05.115929125 +1200
-+++ b/include/net/mac802154.h	2015-06-03 16:51:05.435929117 +1200
+--- a/include/net/mac802154.h	2015-07-09 11:34:31.837009412 +1200
++++ b/include/net/mac802154.h	2015-07-09 11:34:32.197189407 +1200
 @@ -12,15 +12,16 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -5456,96 +5822,173 @@ diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
  
  /* General MAC frame format:
   *  2 bytes: Frame Control
-@@ -35,13 +36,13 @@
+@@ -30,75 +31,121 @@
   */
+ #define MAC802154_FRAME_HARD_HEADER_LEN		(2 + 1 + 20 + 14)
  
- /* indicates that the Short Address changed */
+-/* The following flags are used to indicate changed address settings from
++/**
++ * enum ieee802154_hw_addr_filt_flags - hardware address filtering flags
++ *
++ * The following flags are used to indicate changed address settings from
+  * the stack to the hardware.
++ *
++ * @IEEE802154_AFILT_SADDR_CHANGED: Indicates that the short address will be
++ *	change.
++ *
++ * @IEEE802154_AFILT_IEEEADDR_CHANGED: Indicates that the extended address
++ *	will be change.
++ *
++ * @IEEE802154_AFILT_PANID_CHANGED: Indicates that the pan id will be change.
++ *
++ * @IEEE802154_AFILT_PANC_CHANGED: Indicates that the address filter will
++ *	do frame address filtering as a pan coordinator.
+  */
++enum ieee802154_hw_addr_filt_flags {
++	IEEE802154_AFILT_SADDR_CHANGED		= BIT(0),
++	IEEE802154_AFILT_IEEEADDR_CHANGED	= BIT(1),
++	IEEE802154_AFILT_PANID_CHANGED		= BIT(2),
++	IEEE802154_AFILT_PANC_CHANGED		= BIT(3),
++};
+ 
+-/* indicates that the Short Address changed */
 -#define IEEE802515_AFILT_SADDR_CHANGED		0x00000001
-+#define IEEE802154_AFILT_SADDR_CHANGED		0x00000001
- /* indicates that the IEEE Address changed */
+-/* indicates that the IEEE Address changed */
 -#define IEEE802515_AFILT_IEEEADDR_CHANGED	0x00000002
-+#define IEEE802154_AFILT_IEEEADDR_CHANGED	0x00000002
- /* indicates that the PAN ID changed */
+-/* indicates that the PAN ID changed */
 -#define IEEE802515_AFILT_PANID_CHANGED		0x00000004
-+#define IEEE802154_AFILT_PANID_CHANGED		0x00000004
- /* indicates that PAN Coordinator status changed */
+-/* indicates that PAN Coordinator status changed */
 -#define	IEEE802515_AFILT_PANC_CHANGED		0x00000008
-+#define IEEE802154_AFILT_PANC_CHANGED		0x00000008
- 
+-
++/**
++ * struct ieee802154_hw_addr_filt - hardware address filtering settings
++ *
++ * @pan_id: pan_id which should be set to the hardware address filter.
++ *
++ * @short_addr: short_addr which should be set to the hardware address filter.
++ *
++ * @ieee_addr: extended address which should be set to the hardware address
++ *	filter.
++ *
++ * @pan_coord: boolean if hardware filtering should be operate as coordinator.
++ */
  struct ieee802154_hw_addr_filt {
- 	__le16	pan_id;		/* Each independent PAN selects a unique
-@@ -55,7 +56,14 @@
- 	u8	pan_coord;
+-	__le16	pan_id;		/* Each independent PAN selects a unique
+-				 * identifier. This PAN id allows communication
+-				 * between devices within a network using short
+-				 * addresses and enables transmissions between
+-				 * devices across independent networks.
+-				 */
++	__le16	pan_id;
+ 	__le16	short_addr;
+ 	__le64	ieee_addr;
+-	u8	pan_coord;
++	bool	pan_coord;
  };
  
 -struct ieee802154_dev {
-+struct ieee802154_vif {
-+	int type;
-+
-+	/* must be last */
-+	u8 drv_priv[0] __aligned(sizeof(void *));
-+};
-+
++/**
++ * struct ieee802154_hw - ieee802154 hardware
++ *
++ * @extra_tx_headroom: headroom to reserve in each transmit skb for use by the
++ *	driver (e.g. for transmit headers.)
++ *
++ * @flags: hardware flags, see &enum ieee802154_hw_flags
++ *
++ * @parent: parent device of the hardware.
++ *
++ * @priv: pointer to private area that was allocated for driver use along with
++ *	this structure.
++ *
++ * @phy: This points to the &struct wpan_phy allocated for this 802.15.4 PHY.
++ */
 +struct ieee802154_hw {
  	/* filled by the driver */
  	int	extra_tx_headroom;
  	u32	flags;
-@@ -65,6 +73,7 @@
- 	struct	ieee802154_hw_addr_filt hw_filt;
- 	void	*priv;
+ 	struct	device *parent;
++	void	*priv;
+ 
+ 	/* filled by mac802154 core */
+-	struct	ieee802154_hw_addr_filt hw_filt;
+-	void	*priv;
  	struct	wpan_phy *phy;
-+	size_t vif_data_size;
  };
  
- /* Checksum is in hardware and is omitted from a packet
-@@ -76,29 +85,29 @@
+-/* Checksum is in hardware and is omitted from a packet
++/**
++ * enum ieee802154_hw_flags - hardware flags
+  *
+- * These following flags are used to indicate hardware capabilities to
++ * These flags are used to indicate hardware capabilities to
+  * the stack. Generally, flags here should have their meaning
+  * done in a way that the simplest hardware doesn't need setting
+  * any particular flags. There are some exceptions to this rule,
   * however, so you are advised to review these flags carefully.
++ *
++ * @IEEE802154_HW_TX_OMIT_CKSUM: Indicates that xmitter will add FCS on it's
++ *	own.
++ *
++ * @IEEE802154_HW_LBT: Indicates that transceiver will support listen before
++ *	transmit.
++ *
++ * @IEEE802154_HW_CSMA_PARAMS: Indicates that transceiver will support csma
++ *	parameters (max_be, min_be, backoff exponents).
++ *
++ * @IEEE802154_HW_FRAME_RETRIES: Indicates that transceiver will support ARET
++ *	frame retries setting.
++ *
++ * @IEEE802154_HW_AFILT: Indicates that transceiver will support hardware
++ *	address filter setting.
++ *
++ * @IEEE802154_HW_PROMISCUOUS: Indicates that transceiver will support
++ *	promiscuous mode setting.
++ *
++ * @IEEE802154_HW_RX_OMIT_CKSUM: Indicates that receiver omits FCS.
++ *
++ * @IEEE802154_HW_RX_DROP_BAD_CKSUM: Indicates that receiver will not filter
++ *	frames with bad checksum.
   */
++enum ieee802154_hw_flags {
++	IEEE802154_HW_TX_OMIT_CKSUM	= BIT(0),
++	IEEE802154_HW_LBT		= BIT(1),
++	IEEE802154_HW_CSMA_PARAMS	= BIT(2),
++	IEEE802154_HW_FRAME_RETRIES	= BIT(3),
++	IEEE802154_HW_AFILT		= BIT(4),
++	IEEE802154_HW_PROMISCUOUS	= BIT(5),
++	IEEE802154_HW_RX_OMIT_CKSUM	= BIT(6),
++	IEEE802154_HW_RX_DROP_BAD_CKSUM	= BIT(7),
++};
  
--/* Indicates that receiver omits FCS and xmitter will add FCS on it's own. */
+ /* Indicates that receiver omits FCS and xmitter will add FCS on it's own. */
 -#define	IEEE802154_HW_OMIT_CKSUM	0x00000001
-+/* Indicates that xmitter will add FCS on it's own. */
-+#define IEEE802154_HW_TX_OMIT_CKSUM	0x00000001
- /* Indicates that receiver will autorespond with ACK frames. */
+-/* Indicates that receiver will autorespond with ACK frames. */
 -#define	IEEE802154_HW_AACK		0x00000002
 -/* Indicates that transceiver will support transmit power setting. */
 -#define	IEEE802154_HW_TXPOWER		0x00000004
-+#define IEEE802154_HW_AACK		0x00000002
- /* Indicates that transceiver will support listen before transmit. */
+-/* Indicates that transceiver will support listen before transmit. */
 -#define	IEEE802154_HW_LBT		0x00000008
 -/* Indicates that transceiver will support cca mode setting. */
 -#define	IEEE802154_HW_CCA_MODE		0x00000010
 -/* Indicates that transceiver will support cca ed level setting. */
 -#define	IEEE802154_HW_CCA_ED_LEVEL	0x00000020
-+#define IEEE802154_HW_LBT		0x00000004
- /* Indicates that transceiver will support csma (max_be, min_be, csma retries)
-  * settings. */
+-/* Indicates that transceiver will support csma (max_be, min_be, csma retries)
+- * settings. */
 -#define	IEEE802154_HW_CSMA_PARAMS	0x00000040
-+#define IEEE802154_HW_CSMA_PARAMS	0x00000008
- /* Indicates that transceiver will support ARET frame retries setting. */
+-/* Indicates that transceiver will support ARET frame retries setting. */
 -#define	IEEE802154_HW_FRAME_RETRIES	0x00000080
-+#define IEEE802154_HW_FRAME_RETRIES	0x00000010
-+/* Indicates that transceiver will support hardware address filter setting. */
-+#define IEEE802154_HW_AFILT		0x00000020
-+/* Indicates that transceiver will support promiscuous mode setting. */
-+#define IEEE802154_HW_PROMISCUOUS	0x00000040
-+/* Indicates that receiver omits FCS. */
-+#define IEEE802154_HW_RX_OMIT_CKSUM	0x00000080
-+/* Indicates that receiver will not filter frames with bad checksum. */
-+#define IEEE802154_HW_RX_DROP_BAD_CKSUM	0x00000100
- 
+-
 -/* This groups the most common CSMA support fields into one. */
 -#define IEEE802154_HW_CSMA		(IEEE802154_HW_CCA_MODE | \
 -					 IEEE802154_HW_CCA_ED_LEVEL | \
 -					 IEEE802154_HW_CSMA_PARAMS | \
 -					 IEEE802154_HW_FRAME_RETRIES)
-+/* Indicates that receiver omits FCS and xmitter will add FCS on it's own. */
 +#define IEEE802154_HW_OMIT_CKSUM	(IEEE802154_HW_TX_OMIT_CKSUM | \
 +					 IEEE802154_HW_RX_OMIT_CKSUM)
  
  /* struct ieee802154_ops - callbacks from mac802154 to the driver
   *
-@@ -112,12 +121,24 @@
+@@ -112,12 +159,24 @@
   * stop:  Handler that 802.15.4 module calls for device cleanup.
   *	  This function is called after the last interface is removed.
   *
@@ -5573,7 +6016,7 @@ diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
   *
   * ed:    Handler that 802.15.4 module calls for Energy Detection.
   *	  This function should place the value for detected energy
-@@ -135,7 +156,7 @@
+@@ -135,7 +194,7 @@
   *	  Returns either zero, or negative errno.
   *
   * set_txpower:
@@ -5582,7 +6025,7 @@ diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
   *	  Returns either zero, or negative errno.
   *
   * set_lbt
-@@ -148,7 +169,7 @@
+@@ -148,7 +207,7 @@
   *	  Returns either zero, or negative errno.
   *
   * set_cca_ed_level
@@ -5591,7 +6034,7 @@ diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
   *	  held.
   *	  Returns either zero, or negative errno.
   *
-@@ -159,40 +180,161 @@
+@@ -159,40 +218,144 @@
   * set_frame_retries
   *	  Sets the retransmission attempt limit. Called with pib_lock held.
   *	  Returns either zero, or negative errno.
@@ -5686,8 +6129,7 @@ diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
 + */
 +struct ieee802154_hw *
 +ieee802154_alloc_hw(size_t priv_data_len, const struct ieee802154_ops *ops);
- 
--void ieee802154_rx_irqsafe(struct ieee802154_dev *dev, struct sk_buff *skb,
++
 +/**
 + * ieee802154_free_hw - free hardware descriptor
 + *
@@ -5721,24 +6163,8 @@ diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
 + * @hw: the hardware to unregister
 + */
 +void ieee802154_unregister_hw(struct ieee802154_hw *hw);
-+
-+/**
-+ * ieee802154_rx - receive frame
-+ *
-+ * Use this function to hand received frames to mac802154. The receive
-+ * buffer in @skb must start with an IEEE 802.15.4 header. In case of a
-+ * paged @skb is used, the driver is recommended to put the ieee802154
-+ * header of the frame on the linear part of the @skb to avoid memory
-+ * allocation and/or memcpy by the stack.
-+ *
-+ * This function may not be called in IRQ context. Calls to this function
-+ * for a single hardware must be synchronized against each other.
-+ *
-+ * @hw: the hardware this frame came in on
-+ * @skb: the buffer to receive, owned by mac802154 after this call
-+ */
-+void ieee802154_rx(struct ieee802154_hw *hw, struct sk_buff *skb);
-+
+ 
+-void ieee802154_rx_irqsafe(struct ieee802154_dev *dev, struct sk_buff *skb,
 +/**
 + * ieee802154_rx_irqsafe - receive frame
 + *
@@ -5779,9 +6205,9 @@ diff -urN a/include/net/mac802154.h b/include/net/mac802154.h
  
  #endif /* NET_MAC802154_H */
 diff -urN a/include/net/nl802154.h b/include/net/nl802154.h
---- a/include/net/nl802154.h	2015-06-03 16:51:05.115929125 +1200
-+++ b/include/net/nl802154.h	2015-06-03 16:51:05.443929117 +1200
-@@ -1,126 +1,244 @@
+--- a/include/net/nl802154.h	2015-07-09 11:34:31.845013411 +1200
++++ b/include/net/nl802154.h	2015-07-09 11:34:32.201191407 +1200
+@@ -1,126 +1,246 @@
 +#ifndef __NL802154_H
 +#define __NL802154_H
  /*
@@ -5932,6 +6358,8 @@ diff -urN a/include/net/nl802154.h b/include/net/nl802154.h
 +
 +	NL802154_ATTR_WPAN_PHY_CAPS,
 +
++	NL802154_ATTR_SUPPORTED_COMMANDS,
++
 +	/* add attributes here, update the policy in nl802154.c */
 +
 +	__NL802154_ATTR_AFTER_LAST,
@@ -5956,10 +6384,10 @@ diff -urN a/include/net/nl802154.h b/include/net/nl802154.h
 - * @dev: The device on which disassociation was indicated.
 - * @addr: The device which is disassociating.
 - * @reason: The reason for the disassociation.
+- *
+- * Inform userland that a device has disassociated from the network.
 + * enum nl802154_wpan_phy_capability_attr - wpan phy capability attributes
   *
-- * Inform userland that a device has disassociated from the network.
-- *
 - * Note: This is in section 7.3.3 of the IEEE 802.15.4 document.
 + * @__NL802154_CAP_ATTR_INVALID: attribute number 0 is reserved
 + * @NL802154_CAP_ATTR_CHANNELS: a nested attribute for nl802154_channel_attr
@@ -6033,7 +6461,7 @@ diff -urN a/include/net/nl802154.h b/include/net/nl802154.h
 + * @NL802154_CCA_ENERGY_CARRIER: Carrier sense with energy above threshold
 + * @NL802154_CCA_ALOHA: CCA shall always report an idle medium
 + * @NL802154_CCA_UWB_SHR: UWB preamble sense based on the SHR of a frame
-+ * @NL802154_CCA_UWB_MULTIPEXED: UWB preamble sense based on the packet with
++ * @NL802154_CCA_UWB_MULTIPLEXED: UWB preamble sense based on the packet with
 + *	the multiplexed preamble
 + * @__NL802154_CCA_ATTR_AFTER_LAST: Internal
 + * @NL802154_CCA_ATTR_MAX: Maximum CCA attribute number
@@ -6047,7 +6475,7 @@ diff -urN a/include/net/nl802154.h b/include/net/nl802154.h
 +	NL802154_CCA_ENERGY_CARRIER,
 +	NL802154_CCA_ALOHA,
 +	NL802154_CCA_UWB_SHR,
-+	NL802154_CCA_UWB_MULTIPEXED,
++	NL802154_CCA_UWB_MULTIPLEXED,
 +
 +	/* keep last */
 +	__NL802154_CCA_ATTR_AFTER_LAST,
@@ -6126,7 +6554,7 @@ diff -urN a/include/net/nl802154.h b/include/net/nl802154.h
 -#endif
 +#endif /* __NL802154_H */
 diff -urN a/include/net/wpan-phy.h b/include/net/wpan-phy.h
---- a/include/net/wpan-phy.h	2015-06-03 16:51:05.123929124 +1200
+--- a/include/net/wpan-phy.h	2015-07-09 11:34:31.849015411 +1200
 +++ b/include/net/wpan-phy.h	1970-01-01 12:00:00.000000000 +1200
 @@ -1,105 +0,0 @@
 -/*
@@ -6235,8 +6663,8 @@ diff -urN a/include/net/wpan-phy.h b/include/net/wpan-phy.h
 -}
 -#endif
 diff -urN a/net/6lowpan/iphc.c b/net/6lowpan/iphc.c
---- a/net/6lowpan/iphc.c	2015-06-03 16:51:05.139929124 +1200
-+++ b/net/6lowpan/iphc.c	2015-06-03 16:51:05.483929116 +1200
+--- a/net/6lowpan/iphc.c	2015-07-09 11:34:31.957069411 +1200
++++ b/net/6lowpan/iphc.c	2015-07-09 11:34:32.209195408 +1200
 @@ -15,9 +15,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -6635,12 +7063,14 @@ diff -urN a/net/6lowpan/iphc.c b/net/6lowpan/iphc.c
  
  	head[0] = iphc0;
  	head[1] = iphc1;
-@@ -786,4 +611,18 @@
+@@ -786,4 +611,20 @@
  }
  EXPORT_SYMBOL_GPL(lowpan_header_compress);
  
 +static int __init lowpan_module_init(void)
 +{
++	request_module_nowait("ipv6");
++
 +	request_module_nowait("nhc_dest");
 +	request_module_nowait("nhc_fragment");
 +	request_module_nowait("nhc_hop");
@@ -6655,8 +7085,8 @@ diff -urN a/net/6lowpan/iphc.c b/net/6lowpan/iphc.c
 +
  MODULE_LICENSE("GPL");
 diff -urN a/net/6lowpan/Kconfig b/net/6lowpan/Kconfig
---- a/net/6lowpan/Kconfig	2015-06-03 16:51:05.143929124 +1200
-+++ b/net/6lowpan/Kconfig	2015-06-03 16:51:05.491929116 +1200
+--- a/net/6lowpan/Kconfig	2015-07-09 11:34:31.961071410 +1200
++++ b/net/6lowpan/Kconfig	2015-07-09 11:34:32.213197406 +1200
 @@ -1,6 +1,61 @@
 -config 6LOWPAN
 +menuconfig 6LOWPAN
@@ -6721,8 +7151,8 @@ diff -urN a/net/6lowpan/Kconfig b/net/6lowpan/Kconfig
 +
 +endif
 diff -urN a/net/6lowpan/Makefile b/net/6lowpan/Makefile
---- a/net/6lowpan/Makefile	2015-06-03 16:51:05.147929124 +1200
-+++ b/net/6lowpan/Makefile	2015-06-03 16:51:05.495929115 +1200
+--- a/net/6lowpan/Makefile	2015-07-09 11:34:31.965073409 +1200
++++ b/net/6lowpan/Makefile	2015-07-09 11:34:32.213197406 +1200
 @@ -1,3 +1,12 @@
 -obj-$(CONFIG_6LOWPAN) := 6lowpan.o
 +obj-$(CONFIG_6LOWPAN) += 6lowpan.o
@@ -6740,7 +7170,7 @@ diff -urN a/net/6lowpan/Makefile b/net/6lowpan/Makefile
 +obj-$(CONFIG_6LOWPAN_NHC_UDP) += nhc_udp.o
 diff -urN a/net/6lowpan/nhc.c b/net/6lowpan/nhc.c
 --- a/net/6lowpan/nhc.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc.c	2015-06-03 16:51:05.499929115 +1200
++++ b/net/6lowpan/nhc.c	2015-07-09 11:34:32.217199406 +1200
 @@ -0,0 +1,241 @@
 +/*
 + *	6LoWPAN next header compression
@@ -6985,7 +7415,7 @@ diff -urN a/net/6lowpan/nhc.c b/net/6lowpan/nhc.c
 +EXPORT_SYMBOL(lowpan_nhc_del);
 diff -urN a/net/6lowpan/nhc_dest.c b/net/6lowpan/nhc_dest.c
 --- a/net/6lowpan/nhc_dest.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc_dest.c	2015-06-03 16:51:05.503929115 +1200
++++ b/net/6lowpan/nhc_dest.c	2015-07-09 11:34:32.225203406 +1200
 @@ -0,0 +1,28 @@
 +/*
 + *	6LoWPAN IPv6 Destination Options Header compression according to
@@ -7017,7 +7447,7 @@ diff -urN a/net/6lowpan/nhc_dest.c b/net/6lowpan/nhc_dest.c
 +MODULE_LICENSE("GPL");
 diff -urN a/net/6lowpan/nhc_fragment.c b/net/6lowpan/nhc_fragment.c
 --- a/net/6lowpan/nhc_fragment.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc_fragment.c	2015-06-03 16:51:05.507929115 +1200
++++ b/net/6lowpan/nhc_fragment.c	2015-07-09 11:34:32.225203406 +1200
 @@ -0,0 +1,27 @@
 +/*
 + *	6LoWPAN IPv6 Fragment Header compression according to RFC6282
@@ -7048,7 +7478,7 @@ diff -urN a/net/6lowpan/nhc_fragment.c b/net/6lowpan/nhc_fragment.c
 +MODULE_LICENSE("GPL");
 diff -urN a/net/6lowpan/nhc.h b/net/6lowpan/nhc.h
 --- a/net/6lowpan/nhc.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc.h	2015-06-03 16:51:05.511929115 +1200
++++ b/net/6lowpan/nhc.h	2015-07-09 11:34:32.229205406 +1200
 @@ -0,0 +1,146 @@
 +#ifndef __6LOWPAN_NHC_H
 +#define __6LOWPAN_NHC_H
@@ -7198,7 +7628,7 @@ diff -urN a/net/6lowpan/nhc.h b/net/6lowpan/nhc.h
 +#endif /* __6LOWPAN_NHC_H */
 diff -urN a/net/6lowpan/nhc_hop.c b/net/6lowpan/nhc_hop.c
 --- a/net/6lowpan/nhc_hop.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc_hop.c	2015-06-03 16:51:05.511929115 +1200
++++ b/net/6lowpan/nhc_hop.c	2015-07-09 11:34:32.229205406 +1200
 @@ -0,0 +1,27 @@
 +/*
 + *	6LoWPAN IPv6 Hop-by-Hop Options Header compression according to RFC6282
@@ -7229,7 +7659,7 @@ diff -urN a/net/6lowpan/nhc_hop.c b/net/6lowpan/nhc_hop.c
 +MODULE_LICENSE("GPL");
 diff -urN a/net/6lowpan/nhc_ipv6.c b/net/6lowpan/nhc_ipv6.c
 --- a/net/6lowpan/nhc_ipv6.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc_ipv6.c	2015-06-03 16:51:05.515929115 +1200
++++ b/net/6lowpan/nhc_ipv6.c	2015-07-09 11:34:32.233207406 +1200
 @@ -0,0 +1,27 @@
 +/*
 + *	6LoWPAN IPv6 Header compression according to RFC6282
@@ -7260,7 +7690,7 @@ diff -urN a/net/6lowpan/nhc_ipv6.c b/net/6lowpan/nhc_ipv6.c
 +MODULE_LICENSE("GPL");
 diff -urN a/net/6lowpan/nhc_mobility.c b/net/6lowpan/nhc_mobility.c
 --- a/net/6lowpan/nhc_mobility.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc_mobility.c	2015-06-03 16:51:05.519929115 +1200
++++ b/net/6lowpan/nhc_mobility.c	2015-07-09 11:34:32.233207406 +1200
 @@ -0,0 +1,27 @@
 +/*
 + *	6LoWPAN IPv6 Mobility Header compression according to RFC6282
@@ -7291,7 +7721,7 @@ diff -urN a/net/6lowpan/nhc_mobility.c b/net/6lowpan/nhc_mobility.c
 +MODULE_LICENSE("GPL");
 diff -urN a/net/6lowpan/nhc_routing.c b/net/6lowpan/nhc_routing.c
 --- a/net/6lowpan/nhc_routing.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc_routing.c	2015-06-03 16:51:05.523929115 +1200
++++ b/net/6lowpan/nhc_routing.c	2015-07-09 11:34:32.237209406 +1200
 @@ -0,0 +1,27 @@
 +/*
 + *	6LoWPAN IPv6 Routing Header compression according to RFC6282
@@ -7322,7 +7752,7 @@ diff -urN a/net/6lowpan/nhc_routing.c b/net/6lowpan/nhc_routing.c
 +MODULE_LICENSE("GPL");
 diff -urN a/net/6lowpan/nhc_udp.c b/net/6lowpan/nhc_udp.c
 --- a/net/6lowpan/nhc_udp.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/6lowpan/nhc_udp.c	2015-06-03 16:51:05.527929115 +1200
++++ b/net/6lowpan/nhc_udp.c	2015-07-09 11:34:32.241211406 +1200
 @@ -0,0 +1,157 @@
 +/*
 + *	6LoWPAN IPv6 UDP compression according to RFC6282
@@ -7483,7 +7913,7 @@ diff -urN a/net/6lowpan/nhc_udp.c b/net/6lowpan/nhc_udp.c
 +MODULE_LICENSE("GPL");
 diff -urN a/net/ieee802154/6lowpan/6lowpan_i.h b/net/ieee802154/6lowpan/6lowpan_i.h
 --- a/net/ieee802154/6lowpan/6lowpan_i.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/6lowpan/6lowpan_i.h	2015-06-03 16:51:05.539929114 +1200
++++ b/net/ieee802154/6lowpan/6lowpan_i.h	2015-07-09 11:34:32.241211406 +1200
 @@ -0,0 +1,72 @@
 +#ifndef __IEEE802154_6LOWPAN_I_H__
 +#define __IEEE802154_6LOWPAN_I_H__
@@ -7559,7 +7989,7 @@ diff -urN a/net/ieee802154/6lowpan/6lowpan_i.h b/net/ieee802154/6lowpan/6lowpan_
 +#endif /* __IEEE802154_6LOWPAN_I_H__ */
 diff -urN a/net/ieee802154/6lowpan/core.c b/net/ieee802154/6lowpan/core.c
 --- a/net/ieee802154/6lowpan/core.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/6lowpan/core.c	2015-06-03 16:51:05.543929114 +1200
++++ b/net/ieee802154/6lowpan/core.c	2015-07-09 11:34:32.245213406 +1200
 @@ -0,0 +1,278 @@
 +/* Copyright 2011, Siemens AG
 + * written by Alexander Smirnov <alex.bluesman.smirnov@gmail.com>
@@ -7841,7 +8271,7 @@ diff -urN a/net/ieee802154/6lowpan/core.c b/net/ieee802154/6lowpan/core.c
 +MODULE_ALIAS_RTNL_LINK("lowpan");
 diff -urN a/net/ieee802154/6lowpan/Kconfig b/net/ieee802154/6lowpan/Kconfig
 --- a/net/ieee802154/6lowpan/Kconfig	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/6lowpan/Kconfig	2015-06-03 16:51:05.543929114 +1200
++++ b/net/ieee802154/6lowpan/Kconfig	2015-07-09 11:34:32.245213406 +1200
 @@ -0,0 +1,5 @@
 +config IEEE802154_6LOWPAN
 +	tristate "6lowpan support over IEEE 802.15.4"
@@ -7850,14 +8280,14 @@ diff -urN a/net/ieee802154/6lowpan/Kconfig b/net/ieee802154/6lowpan/Kconfig
 +	  IPv6 compression over IEEE 802.15.4.
 diff -urN a/net/ieee802154/6lowpan/Makefile b/net/ieee802154/6lowpan/Makefile
 --- a/net/ieee802154/6lowpan/Makefile	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/6lowpan/Makefile	2015-06-03 16:51:05.547929114 +1200
++++ b/net/ieee802154/6lowpan/Makefile	2015-07-09 11:34:32.249215406 +1200
 @@ -0,0 +1,3 @@
 +obj-$(CONFIG_IEEE802154_6LOWPAN) += ieee802154_6lowpan.o
 +
 +ieee802154_6lowpan-y := core.o rx.o reassembly.o tx.o
 diff -urN a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
 --- a/net/ieee802154/6lowpan/reassembly.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/6lowpan/reassembly.c	2015-06-03 16:51:05.551929114 +1200
++++ b/net/ieee802154/6lowpan/reassembly.c	2015-07-09 11:34:32.249215406 +1200
 @@ -0,0 +1,585 @@
 +/*	6LoWPAN fragment reassembly
 + *
@@ -8446,7 +8876,7 @@ diff -urN a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassem
 +}
 diff -urN a/net/ieee802154/6lowpan/rx.c b/net/ieee802154/6lowpan/rx.c
 --- a/net/ieee802154/6lowpan/rx.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/6lowpan/rx.c	2015-06-03 16:51:05.555929114 +1200
++++ b/net/ieee802154/6lowpan/rx.c	2015-07-09 11:34:32.253217407 +1200
 @@ -0,0 +1,171 @@
 +/* This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License version 2
@@ -8621,8 +9051,8 @@ diff -urN a/net/ieee802154/6lowpan/rx.c b/net/ieee802154/6lowpan/rx.c
 +}
 diff -urN a/net/ieee802154/6lowpan/tx.c b/net/ieee802154/6lowpan/tx.c
 --- a/net/ieee802154/6lowpan/tx.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/6lowpan/tx.c	2015-06-03 16:51:05.559929114 +1200
-@@ -0,0 +1,271 @@
++++ b/net/ieee802154/6lowpan/tx.c	2015-07-09 11:34:32.257219406 +1200
+@@ -0,0 +1,272 @@
 +/* This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License version 2
 + * as published by the Free Software Foundation.
@@ -8815,6 +9245,7 @@ diff -urN a/net/ieee802154/6lowpan/tx.c b/net/ieee802154/6lowpan/tx.c
 +
 +static int lowpan_header(struct sk_buff *skb, struct net_device *dev)
 +{
++	struct wpan_dev *wpan_dev = lowpan_dev_info(dev)->real_dev->ieee802154_ptr;
 +	struct ieee802154_addr sa, da;
 +	struct ieee802154_mac_cb *cb = mac_cb_init(skb);
 +	struct lowpan_addr_info info;
@@ -8832,7 +9263,7 @@ diff -urN a/net/ieee802154/6lowpan/tx.c b/net/ieee802154/6lowpan/tx.c
 +
 +	/* prepare wpan address data */
 +	sa.mode = IEEE802154_ADDR_LONG;
-+	sa.pan_id = lowpan_dev_info(dev)->real_dev->ieee802154_ptr->pan_id;
++	sa.pan_id = wpan_dev->pan_id;
 +	sa.extended_addr = ieee802154_devaddr_from_raw(saddr);
 +
 +	/* intra-PAN communications */
@@ -8848,7 +9279,7 @@ diff -urN a/net/ieee802154/6lowpan/tx.c b/net/ieee802154/6lowpan/tx.c
 +	} else {
 +		da.mode = IEEE802154_ADDR_LONG;
 +		da.extended_addr = ieee802154_devaddr_from_raw(daddr);
-+		cb->ackreq = true;
++		cb->ackreq = wpan_dev->frame_retries >= 0;
 +	}
 +
 +	return dev_hard_header(skb, lowpan_dev_info(dev)->real_dev,
@@ -8895,7 +9326,7 @@ diff -urN a/net/ieee802154/6lowpan/tx.c b/net/ieee802154/6lowpan/tx.c
 +	}
 +}
 diff -urN a/net/ieee802154/6lowpan_rtnl.c b/net/ieee802154/6lowpan_rtnl.c
---- a/net/ieee802154/6lowpan_rtnl.c	2015-06-03 16:51:05.203929123 +1200
+--- a/net/ieee802154/6lowpan_rtnl.c	2015-07-09 11:34:32.009095409 +1200
 +++ b/net/ieee802154/6lowpan_rtnl.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,732 +0,0 @@
 -/* Copyright 2011, Siemens AG
@@ -9631,7 +10062,7 @@ diff -urN a/net/ieee802154/6lowpan_rtnl.c b/net/ieee802154/6lowpan_rtnl.c
 -MODULE_LICENSE("GPL");
 -MODULE_ALIAS_RTNL_LINK("lowpan");
 diff -urN a/net/ieee802154/af802154.h b/net/ieee802154/af802154.h
---- a/net/ieee802154/af802154.h	2015-06-03 16:51:05.203929123 +1200
+--- a/net/ieee802154/af802154.h	2015-07-09 11:34:32.009095409 +1200
 +++ b/net/ieee802154/af802154.h	1970-01-01 12:00:00.000000000 +1200
 @@ -1,37 +0,0 @@
 -/*
@@ -9672,7 +10103,7 @@ diff -urN a/net/ieee802154/af802154.h b/net/ieee802154/af802154.h
 -
 -#endif
 diff -urN a/net/ieee802154/af_ieee802154.c b/net/ieee802154/af_ieee802154.c
---- a/net/ieee802154/af_ieee802154.c	2015-06-03 16:51:05.207929122 +1200
+--- a/net/ieee802154/af_ieee802154.c	2015-07-09 11:34:32.013097409 +1200
 +++ b/net/ieee802154/af_ieee802154.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,373 +0,0 @@
 -/*
@@ -10050,7 +10481,7 @@ diff -urN a/net/ieee802154/af_ieee802154.c b/net/ieee802154/af_ieee802154.c
 -MODULE_ALIAS_NETPROTO(PF_IEEE802154);
 diff -urN a/net/ieee802154/core.c b/net/ieee802154/core.c
 --- a/net/ieee802154/core.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/core.c	2015-06-03 16:51:05.567929114 +1200
++++ b/net/ieee802154/core.c	2015-07-09 11:34:32.265223406 +1200
 @@ -0,0 +1,323 @@
 +/*
 + * Copyright (C) 2007, 2008, 2009 Siemens AG
@@ -10377,7 +10808,7 @@ diff -urN a/net/ieee802154/core.c b/net/ieee802154/core.c
 +
 diff -urN a/net/ieee802154/core.h b/net/ieee802154/core.h
 --- a/net/ieee802154/core.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/core.h	2015-06-03 16:51:05.571929114 +1200
++++ b/net/ieee802154/core.h	2015-07-09 11:34:32.265223406 +1200
 @@ -0,0 +1,46 @@
 +#ifndef __IEEE802154_CORE_H
 +#define __IEEE802154_CORE_H
@@ -10426,7 +10857,7 @@ diff -urN a/net/ieee802154/core.h b/net/ieee802154/core.h
 +
 +#endif /* __IEEE802154_CORE_H */
 diff -urN a/net/ieee802154/dgram.c b/net/ieee802154/dgram.c
---- a/net/ieee802154/dgram.c	2015-06-03 16:51:05.219929122 +1200
+--- a/net/ieee802154/dgram.c	2015-07-09 11:34:32.021101409 +1200
 +++ b/net/ieee802154/dgram.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,554 +0,0 @@
 -/*
@@ -10984,8 +11415,8 @@ diff -urN a/net/ieee802154/dgram.c b/net/ieee802154/dgram.c
 -};
 -
 diff -urN a/net/ieee802154/header_ops.c b/net/ieee802154/header_ops.c
---- a/net/ieee802154/header_ops.c	2015-06-03 16:51:05.219929122 +1200
-+++ b/net/ieee802154/header_ops.c	2015-06-03 16:51:05.579929113 +1200
+--- a/net/ieee802154/header_ops.c	2015-07-09 11:34:32.021101409 +1200
++++ b/net/ieee802154/header_ops.c	2015-07-09 11:34:32.269225406 +1200
 @@ -14,8 +14,9 @@
   * Phoebe Buckheister <phoebe.buckheister@itwm.fraunhofer.de>
   */
@@ -10998,8 +11429,8 @@ diff -urN a/net/ieee802154/header_ops.c b/net/ieee802154/header_ops.c
  
  static int
 diff -urN a/net/ieee802154/ieee802154.h b/net/ieee802154/ieee802154.h
---- a/net/ieee802154/ieee802154.h	2015-06-03 16:51:05.223929122 +1200
-+++ b/net/ieee802154/ieee802154.h	2015-06-03 16:51:05.583929113 +1200
+--- a/net/ieee802154/ieee802154.h	2015-07-09 11:34:32.025103409 +1200
++++ b/net/ieee802154/ieee802154.h	2015-07-09 11:34:32.273227406 +1200
 @@ -10,16 +10,12 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -11019,8 +11450,8 @@ diff -urN a/net/ieee802154/ieee802154.h b/net/ieee802154/ieee802154.h
  #define IEEE802154_OP(_cmd, _func)			\
  	{						\
 diff -urN a/net/ieee802154/Kconfig b/net/ieee802154/Kconfig
---- a/net/ieee802154/Kconfig	2015-06-03 16:51:05.227929122 +1200
-+++ b/net/ieee802154/Kconfig	2015-06-03 16:51:05.583929113 +1200
+--- a/net/ieee802154/Kconfig	2015-07-09 11:34:32.029105409 +1200
++++ b/net/ieee802154/Kconfig	2015-07-09 11:34:32.273227406 +1200
 @@ -1,4 +1,4 @@
 -config IEEE802154
 +menuconfig IEEE802154
@@ -11049,8 +11480,8 @@ diff -urN a/net/ieee802154/Kconfig b/net/ieee802154/Kconfig
 +
 +endif
 diff -urN a/net/ieee802154/Makefile b/net/ieee802154/Makefile
---- a/net/ieee802154/Makefile	2015-06-03 16:51:05.231929122 +1200
-+++ b/net/ieee802154/Makefile	2015-06-03 16:51:05.587929113 +1200
+--- a/net/ieee802154/Makefile	2015-07-09 11:34:32.029105409 +1200
++++ b/net/ieee802154/Makefile	2015-07-09 11:34:32.277229406 +1200
 @@ -1,9 +1,11 @@
 -obj-$(CONFIG_IEEE802154) += ieee802154.o af_802154.o
 -obj-$(CONFIG_IEEE802154_6LOWPAN) += ieee802154_6lowpan.o
@@ -11070,8 +11501,8 @@ diff -urN a/net/ieee802154/Makefile b/net/ieee802154/Makefile
  
  ccflags-y += -D__CHECK_ENDIAN__
 diff -urN a/net/ieee802154/netlink.c b/net/ieee802154/netlink.c
---- a/net/ieee802154/netlink.c	2015-06-03 16:51:05.235929122 +1200
-+++ b/net/ieee802154/netlink.c	2015-06-03 16:51:05.591929113 +1200
+--- a/net/ieee802154/netlink.c	2015-07-09 11:34:32.033107409 +1200
++++ b/net/ieee802154/netlink.c	2015-07-09 11:34:32.281231406 +1200
 @@ -1,5 +1,5 @@
  /*
 - * Netlink inteface for IEEE 802.15.4 stack
@@ -11144,8 +11575,8 @@ diff -urN a/net/ieee802154/netlink.c b/net/ieee802154/netlink.c
  }
 diff -urN a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
 --- a/net/ieee802154/nl802154.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/nl802154.c	2015-06-03 16:51:05.595929113 +1200
-@@ -0,0 +1,1223 @@
++++ b/net/ieee802154/nl802154.c	2015-07-09 11:34:32.281231406 +1200
+@@ -0,0 +1,1263 @@
 +/* This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License version 2
 + * as published by the Free Software Foundation.
@@ -11376,6 +11807,8 @@ diff -urN a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
 +	[NL802154_ATTR_LBT_MODE] = { .type = NLA_U8, },
 +
 +	[NL802154_ATTR_WPAN_PHY_CAPS] = { .type = NLA_NESTED },
++
++	[NL802154_ATTR_SUPPORTED_COMMANDS] = { .type = NLA_NESTED },
 +};
 +
 +/* message building helper */
@@ -11520,7 +11953,9 @@ diff -urN a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
 +				  struct sk_buff *msg, u32 portid, u32 seq,
 +				  int flags)
 +{
++	struct nlattr *nl_cmds;
 +	void *hdr;
++	int i;
 +
 +	hdr = nl802154hdr_put(msg, portid, seq, flags, cmd);
 +	if (!hdr)
@@ -11578,6 +12013,42 @@ diff -urN a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
 +
 +	if (nl802154_put_capabilities(msg, rdev))
 +		goto nla_put_failure;
++
++	nl_cmds = nla_nest_start(msg, NL802154_ATTR_SUPPORTED_COMMANDS);
++	if (!nl_cmds)
++		goto nla_put_failure;
++
++	i = 0;
++#define CMD(op, n)							\
++	do {								\
++		if (rdev->ops->op) {					\
++			i++;						\
++			if (nla_put_u32(msg, i, NL802154_CMD_ ## n))	\
++				goto nla_put_failure;			\
++		}							\
++	} while (0)
++
++	CMD(add_virtual_intf, NEW_INTERFACE);
++	CMD(del_virtual_intf, DEL_INTERFACE);
++	CMD(set_channel, SET_CHANNEL);
++	CMD(set_pan_id, SET_PAN_ID);
++	CMD(set_short_addr, SET_SHORT_ADDR);
++	CMD(set_backoff_exponent, SET_BACKOFF_EXPONENT);
++	CMD(set_max_csma_backoffs, SET_MAX_CSMA_BACKOFFS);
++	CMD(set_max_frame_retries, SET_MAX_FRAME_RETRIES);
++	CMD(set_lbt_mode, SET_LBT_MODE);
++
++	if (rdev->wpan_phy.flags & WPAN_PHY_FLAG_TXPOWER)
++		CMD(set_tx_power, SET_TX_POWER);
++
++	if (rdev->wpan_phy.flags & WPAN_PHY_FLAG_CCA_ED_LEVEL)
++		CMD(set_cca_ed_level, SET_CCA_ED_LEVEL);
++
++	if (rdev->wpan_phy.flags & WPAN_PHY_FLAG_CCA_MODE)
++		CMD(set_cca_mode, SET_CCA_MODE);
++
++#undef CMD
++	nla_nest_end(msg, nl_cmds);
 +
 +finish:
 +	genlmsg_end(msg, hdr);
@@ -12371,7 +12842,7 @@ diff -urN a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
 +}
 diff -urN a/net/ieee802154/nl802154.h b/net/ieee802154/nl802154.h
 --- a/net/ieee802154/nl802154.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/nl802154.h	2015-06-03 16:51:05.599929113 +1200
++++ b/net/ieee802154/nl802154.h	2015-07-09 11:34:32.285233406 +1200
 @@ -0,0 +1,7 @@
 +#ifndef __IEEE802154_NL802154_H
 +#define __IEEE802154_NL802154_H
@@ -12381,8 +12852,8 @@ diff -urN a/net/ieee802154/nl802154.h b/net/ieee802154/nl802154.h
 +
 +#endif /* __IEEE802154_NL802154_H */
 diff -urN a/net/ieee802154/nl-mac.c b/net/ieee802154/nl-mac.c
---- a/net/ieee802154/nl-mac.c	2015-06-03 16:51:05.243929122 +1200
-+++ b/net/ieee802154/nl-mac.c	2015-06-03 16:51:05.599929113 +1200
+--- a/net/ieee802154/nl-mac.c	2015-07-09 11:34:32.041111409 +1200
++++ b/net/ieee802154/nl-mac.c	2015-07-09 11:34:32.285233406 +1200
 @@ -1,5 +1,5 @@
  /*
 - * Netlink inteface for IEEE 802.15.4 stack
@@ -12864,8 +13335,8 @@ diff -urN a/net/ieee802154/nl-mac.c b/net/ieee802154/nl-mac.c
  llsec_parse_seclevel(struct genl_info *info,
  		     struct ieee802154_llsec_seclevel *sl)
 diff -urN a/net/ieee802154/nl-phy.c b/net/ieee802154/nl-phy.c
---- a/net/ieee802154/nl-phy.c	2015-06-03 16:51:05.247929121 +1200
-+++ b/net/ieee802154/nl-phy.c	2015-06-03 16:51:05.603929113 +1200
+--- a/net/ieee802154/nl-phy.c	2015-07-09 11:34:32.041111409 +1200
++++ b/net/ieee802154/nl-phy.c	2015-07-09 11:34:32.289235406 +1200
 @@ -1,5 +1,5 @@
  /*
 - * Netlink inteface for IEEE 802.15.4 stack
@@ -13024,8 +13495,8 @@ diff -urN a/net/ieee802154/nl-phy.c b/net/ieee802154/nl-phy.c
  	/* We don't have device anymore */
  	dev_put(dev);
 diff -urN a/net/ieee802154/nl_policy.c b/net/ieee802154/nl_policy.c
---- a/net/ieee802154/nl_policy.c	2015-06-03 16:51:05.251929121 +1200
-+++ b/net/ieee802154/nl_policy.c	2015-06-03 16:51:05.607929113 +1200
+--- a/net/ieee802154/nl_policy.c	2015-07-09 11:34:32.045113409 +1200
++++ b/net/ieee802154/nl_policy.c	2015-07-09 11:34:32.289235406 +1200
 @@ -12,10 +12,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -13038,7 +13509,7 @@ diff -urN a/net/ieee802154/nl_policy.c b/net/ieee802154/nl_policy.c
  
  #include <linux/kernel.h>
 diff -urN a/net/ieee802154/raw.c b/net/ieee802154/raw.c
---- a/net/ieee802154/raw.c	2015-06-03 16:51:05.251929121 +1200
+--- a/net/ieee802154/raw.c	2015-07-09 11:34:32.049115409 +1200
 +++ b/net/ieee802154/raw.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,275 +0,0 @@
 -/*
@@ -13318,8 +13789,8 @@ diff -urN a/net/ieee802154/raw.c b/net/ieee802154/raw.c
 -};
 diff -urN a/net/ieee802154/rdev-ops.h b/net/ieee802154/rdev-ops.h
 --- a/net/ieee802154/rdev-ops.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/rdev-ops.h	2015-06-03 16:51:05.611929113 +1200
-@@ -0,0 +1,178 @@
++++ b/net/ieee802154/rdev-ops.h	2015-07-09 11:34:32.293237406 +1200
+@@ -0,0 +1,198 @@
 +#ifndef __CFG802154_RDEV_OPS
 +#define __CFG802154_RDEV_OPS
 +
@@ -13343,6 +13814,26 @@ diff -urN a/net/ieee802154/rdev-ops.h b/net/ieee802154/rdev-ops.h
 +				 struct net_device *dev)
 +{
 +	rdev->ops->del_virtual_intf_deprecated(&rdev->wpan_phy, dev);
++}
++
++static inline int
++rdev_suspend(struct cfg802154_registered_device *rdev)
++{
++	int ret;
++	trace_802154_rdev_suspend(&rdev->wpan_phy);
++	ret = rdev->ops->suspend(&rdev->wpan_phy);
++	trace_802154_rdev_return_int(&rdev->wpan_phy, ret);
++	return ret;
++}
++
++static inline int
++rdev_resume(struct cfg802154_registered_device *rdev)
++{
++	int ret;
++	trace_802154_rdev_resume(&rdev->wpan_phy);
++	ret = rdev->ops->resume(&rdev->wpan_phy);
++	trace_802154_rdev_return_int(&rdev->wpan_phy, ret);
++	return ret;
 +}
 +
 +static inline int
@@ -13499,7 +13990,7 @@ diff -urN a/net/ieee802154/rdev-ops.h b/net/ieee802154/rdev-ops.h
 +
 +#endif /* __CFG802154_RDEV_OPS */
 diff -urN a/net/ieee802154/reassembly.c b/net/ieee802154/reassembly.c
---- a/net/ieee802154/reassembly.c	2015-06-03 16:51:05.259929121 +1200
+--- a/net/ieee802154/reassembly.c	2015-07-09 11:34:32.053117409 +1200
 +++ b/net/ieee802154/reassembly.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,583 +0,0 @@
 -/*	6LoWPAN fragment reassembly
@@ -14086,7 +14577,7 @@ diff -urN a/net/ieee802154/reassembly.c b/net/ieee802154/reassembly.c
 -	unregister_pernet_subsys(&lowpan_frags_ops);
 -}
 diff -urN a/net/ieee802154/reassembly.h b/net/ieee802154/reassembly.h
---- a/net/ieee802154/reassembly.h	2015-06-03 16:51:05.263929121 +1200
+--- a/net/ieee802154/reassembly.h	2015-07-09 11:34:32.057119409 +1200
 +++ b/net/ieee802154/reassembly.h	1970-01-01 12:00:00.000000000 +1200
 @@ -1,41 +0,0 @@
 -#ifndef __IEEE802154_6LOWPAN_REASSEMBLY_H__
@@ -14132,8 +14623,8 @@ diff -urN a/net/ieee802154/reassembly.h b/net/ieee802154/reassembly.h
 -#endif /* __IEEE802154_6LOWPAN_REASSEMBLY_H__ */
 diff -urN a/net/ieee802154/socket.c b/net/ieee802154/socket.c
 --- a/net/ieee802154/socket.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/socket.c	2015-06-03 16:51:05.719929110 +1200
-@@ -0,0 +1,1115 @@
++++ b/net/ieee802154/socket.c	2015-07-09 11:34:32.393287403 +1200
+@@ -0,0 +1,1121 @@
 +/*
 + * IEEE802154.4 socket interface
 + *
@@ -14868,6 +15359,12 @@ diff -urN a/net/ieee802154/socket.c b/net/ieee802154/socket.c
 +	sock_recv_ts_and_drops(msg, sk, skb);
 +
 +	if (saddr) {
++		/* Clear the implicit padding in struct sockaddr_ieee802154
++		 * (16 bits between 'family' and 'addr') and in struct
++		 * ieee802154_addr_sa (16 bits at the end of the structure).
++		 */
++		memset(saddr, 0, sizeof(*saddr));
++
 +		saddr->family = AF_IEEE802154;
 +		ieee802154_addr_to_sa(&saddr->addr, &mac_cb(skb)->source);
 +		*addr_len = sizeof(*saddr);
@@ -15249,10 +15746,1134 @@ diff -urN a/net/ieee802154/socket.c b/net/ieee802154/socket.c
 +
 +MODULE_LICENSE("GPL");
 +MODULE_ALIAS_NETPROTO(PF_IEEE802154);
+diff -urN a/net/ieee802154/socket.c.orig b/net/ieee802154/socket.c.orig
+--- a/net/ieee802154/socket.c.orig	1970-01-01 12:00:00.000000000 +1200
++++ b/net/ieee802154/socket.c.orig	2015-07-09 11:34:32.301241405 +1200
+@@ -0,0 +1,1120 @@
++/*
++ * IEEE802154.4 socket interface
++ *
++ * Copyright 2007, 2008 Siemens AG
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * Written by:
++ * Sergey Lapin <slapin@ossfans.org>
++ * Maxim Gorbachyov <maxim.gorbachev@siemens.com>
++ */
++
++#include <linux/net.h>
++#include <linux/capability.h>
++#include <linux/module.h>
++#include <linux/if_arp.h>
++#include <linux/if.h>
++#include <linux/termios.h>	/* For TIOCOUTQ/INQ */
++#include <linux/list.h>
++#include <linux/slab.h>
++#include <net/datalink.h>
++#include <net/psnap.h>
++#include <net/sock.h>
++#include <net/tcp_states.h>
++#include <net/route.h>
++
++#include <net/af_ieee802154.h>
++#include <net/ieee802154_netdev.h>
++
++/* Utility function for families */
++static struct net_device*
++ieee802154_get_dev(struct net *net, const struct ieee802154_addr *addr)
++{
++	struct net_device *dev = NULL;
++	struct net_device *tmp;
++	__le16 pan_id, short_addr;
++	u8 hwaddr[IEEE802154_ADDR_LEN];
++
++	switch (addr->mode) {
++	case IEEE802154_ADDR_LONG:
++		ieee802154_devaddr_to_raw(hwaddr, addr->extended_addr);
++		rcu_read_lock();
++		dev = dev_getbyhwaddr_rcu(net, ARPHRD_IEEE802154, hwaddr);
++		if (dev)
++			dev_hold(dev);
++		rcu_read_unlock();
++		break;
++	case IEEE802154_ADDR_SHORT:
++		if (addr->pan_id == cpu_to_le16(IEEE802154_PANID_BROADCAST) ||
++		    addr->short_addr == cpu_to_le16(IEEE802154_ADDR_UNDEF) ||
++		    addr->short_addr == cpu_to_le16(IEEE802154_ADDR_BROADCAST))
++			break;
++
++		rtnl_lock();
++
++		for_each_netdev(net, tmp) {
++			if (tmp->type != ARPHRD_IEEE802154)
++				continue;
++
++			pan_id = tmp->ieee802154_ptr->pan_id;
++			short_addr = tmp->ieee802154_ptr->short_addr;
++			if (pan_id == addr->pan_id &&
++			    short_addr == addr->short_addr) {
++				dev = tmp;
++				dev_hold(dev);
++				break;
++			}
++		}
++
++		rtnl_unlock();
++		break;
++	default:
++		pr_warn("Unsupported ieee802154 address type: %d\n",
++			addr->mode);
++		break;
++	}
++
++	return dev;
++}
++
++static int ieee802154_sock_release(struct socket *sock)
++{
++	struct sock *sk = sock->sk;
++
++	if (sk) {
++		sock->sk = NULL;
++		sk->sk_prot->close(sk, 0);
++	}
++	return 0;
++}
++
++static int ieee802154_sock_sendmsg(struct socket *sock, struct msghdr *msg,
++				   size_t len)
++{
++	struct sock *sk = sock->sk;
++
++	return sk->sk_prot->sendmsg(sk, msg, len);
++}
++
++static int ieee802154_sock_bind(struct socket *sock, struct sockaddr *uaddr,
++				int addr_len)
++{
++	struct sock *sk = sock->sk;
++
++	if (sk->sk_prot->bind)
++		return sk->sk_prot->bind(sk, uaddr, addr_len);
++
++	return sock_no_bind(sock, uaddr, addr_len);
++}
++
++static int ieee802154_sock_connect(struct socket *sock, struct sockaddr *uaddr,
++				   int addr_len, int flags)
++{
++	struct sock *sk = sock->sk;
++
++	if (addr_len < sizeof(uaddr->sa_family))
++		return -EINVAL;
++
++	if (uaddr->sa_family == AF_UNSPEC)
++		return sk->sk_prot->disconnect(sk, flags);
++
++	return sk->sk_prot->connect(sk, uaddr, addr_len);
++}
++
++static int ieee802154_dev_ioctl(struct sock *sk, struct ifreq __user *arg,
++				unsigned int cmd)
++{
++	struct ifreq ifr;
++	int ret = -ENOIOCTLCMD;
++	struct net_device *dev;
++
++	if (copy_from_user(&ifr, arg, sizeof(struct ifreq)))
++		return -EFAULT;
++
++	ifr.ifr_name[IFNAMSIZ-1] = 0;
++
++	dev_load(sock_net(sk), ifr.ifr_name);
++	dev = dev_get_by_name(sock_net(sk), ifr.ifr_name);
++
++	if (!dev)
++		return -ENODEV;
++
++	if (dev->type == ARPHRD_IEEE802154 && dev->netdev_ops->ndo_do_ioctl)
++		ret = dev->netdev_ops->ndo_do_ioctl(dev, &ifr, cmd);
++
++	if (!ret && copy_to_user(arg, &ifr, sizeof(struct ifreq)))
++		ret = -EFAULT;
++	dev_put(dev);
++
++	return ret;
++}
++
++static int ieee802154_sock_ioctl(struct socket *sock, unsigned int cmd,
++				 unsigned long arg)
++{
++	struct sock *sk = sock->sk;
++
++	switch (cmd) {
++	case SIOCGSTAMP:
++		return sock_get_timestamp(sk, (struct timeval __user *)arg);
++	case SIOCGSTAMPNS:
++		return sock_get_timestampns(sk, (struct timespec __user *)arg);
++	case SIOCGIFADDR:
++	case SIOCSIFADDR:
++		return ieee802154_dev_ioctl(sk, (struct ifreq __user *)arg,
++				cmd);
++	default:
++		if (!sk->sk_prot->ioctl)
++			return -ENOIOCTLCMD;
++		return sk->sk_prot->ioctl(sk, cmd, arg);
++	}
++}
++
++/* RAW Sockets (802.15.4 created in userspace) */
++static HLIST_HEAD(raw_head);
++static DEFINE_RWLOCK(raw_lock);
++
++static void raw_hash(struct sock *sk)
++{
++	write_lock_bh(&raw_lock);
++	sk_add_node(sk, &raw_head);
++	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
++	write_unlock_bh(&raw_lock);
++}
++
++static void raw_unhash(struct sock *sk)
++{
++	write_lock_bh(&raw_lock);
++	if (sk_del_node_init(sk))
++		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
++	write_unlock_bh(&raw_lock);
++}
++
++static void raw_close(struct sock *sk, long timeout)
++{
++	sk_common_release(sk);
++}
++
++static int raw_bind(struct sock *sk, struct sockaddr *_uaddr, int len)
++{
++	struct ieee802154_addr addr;
++	struct sockaddr_ieee802154 *uaddr = (struct sockaddr_ieee802154 *)_uaddr;
++	int err = 0;
++	struct net_device *dev = NULL;
++
++	if (len < sizeof(*uaddr))
++		return -EINVAL;
++
++	uaddr = (struct sockaddr_ieee802154 *)_uaddr;
++	if (uaddr->family != AF_IEEE802154)
++		return -EINVAL;
++
++	lock_sock(sk);
++
++	ieee802154_addr_from_sa(&addr, &uaddr->addr);
++	dev = ieee802154_get_dev(sock_net(sk), &addr);
++	if (!dev) {
++		err = -ENODEV;
++		goto out;
++	}
++
++	sk->sk_bound_dev_if = dev->ifindex;
++	sk_dst_reset(sk);
++
++	dev_put(dev);
++out:
++	release_sock(sk);
++
++	return err;
++}
++
++static int raw_connect(struct sock *sk, struct sockaddr *uaddr,
++		       int addr_len)
++{
++	return -ENOTSUPP;
++}
++
++static int raw_disconnect(struct sock *sk, int flags)
++{
++	return 0;
++}
++
++static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
++{
++	struct net_device *dev;
++	unsigned int mtu;
++	struct sk_buff *skb;
++	int hlen, tlen;
++	int err;
++
++	if (msg->msg_flags & MSG_OOB) {
++		pr_debug("msg->msg_flags = 0x%x\n", msg->msg_flags);
++		return -EOPNOTSUPP;
++	}
++
++	lock_sock(sk);
++	if (!sk->sk_bound_dev_if)
++		dev = dev_getfirstbyhwtype(sock_net(sk), ARPHRD_IEEE802154);
++	else
++		dev = dev_get_by_index(sock_net(sk), sk->sk_bound_dev_if);
++	release_sock(sk);
++
++	if (!dev) {
++		pr_debug("no dev\n");
++		err = -ENXIO;
++		goto out;
++	}
++
++	mtu = dev->mtu;
++	pr_debug("name = %s, mtu = %u\n", dev->name, mtu);
++
++	if (size > mtu) {
++		pr_debug("size = %Zu, mtu = %u\n", size, mtu);
++		err = -EMSGSIZE;
++		goto out_dev;
++	}
++
++	hlen = LL_RESERVED_SPACE(dev);
++	tlen = dev->needed_tailroom;
++	skb = sock_alloc_send_skb(sk, hlen + tlen + size,
++				  msg->msg_flags & MSG_DONTWAIT, &err);
++	if (!skb)
++		goto out_dev;
++
++	skb_reserve(skb, hlen);
++
++	skb_reset_mac_header(skb);
++	skb_reset_network_header(skb);
++
++	err = memcpy_from_msg(skb_put(skb, size), msg, size);
++	if (err < 0)
++		goto out_skb;
++
++	skb->dev = dev;
++	skb->sk  = sk;
++	skb->protocol = htons(ETH_P_IEEE802154);
++
++	dev_put(dev);
++
++	err = dev_queue_xmit(skb);
++	if (err > 0)
++		err = net_xmit_errno(err);
++
++	return err ?: size;
++
++out_skb:
++	kfree_skb(skb);
++out_dev:
++	dev_put(dev);
++out:
++	return err;
++}
++
++static int raw_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
++		       int noblock, int flags, int *addr_len)
++{
++	size_t copied = 0;
++	int err = -EOPNOTSUPP;
++	struct sk_buff *skb;
++
++	skb = skb_recv_datagram(sk, flags, noblock, &err);
++	if (!skb)
++		goto out;
++
++	copied = skb->len;
++	if (len < copied) {
++		msg->msg_flags |= MSG_TRUNC;
++		copied = len;
++	}
++
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
++	if (err)
++		goto done;
++
++	sock_recv_ts_and_drops(msg, sk, skb);
++
++	if (flags & MSG_TRUNC)
++		copied = skb->len;
++done:
++	skb_free_datagram(sk, skb);
++out:
++	if (err)
++		return err;
++	return copied;
++}
++
++static int raw_rcv_skb(struct sock *sk, struct sk_buff *skb)
++{
++	skb = skb_share_check(skb, GFP_ATOMIC);
++	if (!skb)
++		return NET_RX_DROP;
++
++	if (sock_queue_rcv_skb(sk, skb) < 0) {
++		kfree_skb(skb);
++		return NET_RX_DROP;
++	}
++
++	return NET_RX_SUCCESS;
++}
++
++static void ieee802154_raw_deliver(struct net_device *dev, struct sk_buff *skb)
++{
++	struct sock *sk;
++
++	read_lock(&raw_lock);
++	sk_for_each(sk, &raw_head) {
++		bh_lock_sock(sk);
++		if (!sk->sk_bound_dev_if ||
++		    sk->sk_bound_dev_if == dev->ifindex) {
++			struct sk_buff *clone;
++
++			clone = skb_clone(skb, GFP_ATOMIC);
++			if (clone)
++				raw_rcv_skb(sk, clone);
++		}
++		bh_unlock_sock(sk);
++	}
++	read_unlock(&raw_lock);
++}
++
++static int raw_getsockopt(struct sock *sk, int level, int optname,
++			  char __user *optval, int __user *optlen)
++{
++	return -EOPNOTSUPP;
++}
++
++static int raw_setsockopt(struct sock *sk, int level, int optname,
++			  char __user *optval, unsigned int optlen)
++{
++	return -EOPNOTSUPP;
++}
++
++static struct proto ieee802154_raw_prot = {
++	.name		= "IEEE-802.15.4-RAW",
++	.owner		= THIS_MODULE,
++	.obj_size	= sizeof(struct sock),
++	.close		= raw_close,
++	.bind		= raw_bind,
++	.sendmsg	= raw_sendmsg,
++	.recvmsg	= raw_recvmsg,
++	.hash		= raw_hash,
++	.unhash		= raw_unhash,
++	.connect	= raw_connect,
++	.disconnect	= raw_disconnect,
++	.getsockopt	= raw_getsockopt,
++	.setsockopt	= raw_setsockopt,
++};
++
++static const struct proto_ops ieee802154_raw_ops = {
++	.family		   = PF_IEEE802154,
++	.owner		   = THIS_MODULE,
++	.release	   = ieee802154_sock_release,
++	.bind		   = ieee802154_sock_bind,
++	.connect	   = ieee802154_sock_connect,
++	.socketpair	   = sock_no_socketpair,
++	.accept		   = sock_no_accept,
++	.getname	   = sock_no_getname,
++	.poll		   = datagram_poll,
++	.ioctl		   = ieee802154_sock_ioctl,
++	.listen		   = sock_no_listen,
++	.shutdown	   = sock_no_shutdown,
++	.setsockopt	   = sock_common_setsockopt,
++	.getsockopt	   = sock_common_getsockopt,
++	.sendmsg	   = ieee802154_sock_sendmsg,
++	.recvmsg	   = sock_common_recvmsg,
++	.mmap		   = sock_no_mmap,
++	.sendpage	   = sock_no_sendpage,
++#ifdef CONFIG_COMPAT
++	.compat_setsockopt = compat_sock_common_setsockopt,
++	.compat_getsockopt = compat_sock_common_getsockopt,
++#endif
++};
++
++/* DGRAM Sockets (802.15.4 dataframes) */
++static HLIST_HEAD(dgram_head);
++static DEFINE_RWLOCK(dgram_lock);
++
++struct dgram_sock {
++	struct sock sk;
++
++	struct ieee802154_addr src_addr;
++	struct ieee802154_addr dst_addr;
++
++	unsigned int bound:1;
++	unsigned int connected:1;
++	unsigned int want_ack:1;
++	unsigned int secen:1;
++	unsigned int secen_override:1;
++	unsigned int seclevel:3;
++	unsigned int seclevel_override:1;
++};
++
++static inline struct dgram_sock *dgram_sk(const struct sock *sk)
++{
++	return container_of(sk, struct dgram_sock, sk);
++}
++
++static void dgram_hash(struct sock *sk)
++{
++	write_lock_bh(&dgram_lock);
++	sk_add_node(sk, &dgram_head);
++	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
++	write_unlock_bh(&dgram_lock);
++}
++
++static void dgram_unhash(struct sock *sk)
++{
++	write_lock_bh(&dgram_lock);
++	if (sk_del_node_init(sk))
++		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
++	write_unlock_bh(&dgram_lock);
++}
++
++static int dgram_init(struct sock *sk)
++{
++	struct dgram_sock *ro = dgram_sk(sk);
++
++	ro->want_ack = 1;
++	return 0;
++}
++
++static void dgram_close(struct sock *sk, long timeout)
++{
++	sk_common_release(sk);
++}
++
++static int dgram_bind(struct sock *sk, struct sockaddr *uaddr, int len)
++{
++	struct sockaddr_ieee802154 *addr = (struct sockaddr_ieee802154 *)uaddr;
++	struct ieee802154_addr haddr;
++	struct dgram_sock *ro = dgram_sk(sk);
++	int err = -EINVAL;
++	struct net_device *dev;
++
++	lock_sock(sk);
++
++	ro->bound = 0;
++
++	if (len < sizeof(*addr))
++		goto out;
++
++	if (addr->family != AF_IEEE802154)
++		goto out;
++
++	ieee802154_addr_from_sa(&haddr, &addr->addr);
++	dev = ieee802154_get_dev(sock_net(sk), &haddr);
++	if (!dev) {
++		err = -ENODEV;
++		goto out;
++	}
++
++	if (dev->type != ARPHRD_IEEE802154) {
++		err = -ENODEV;
++		goto out_put;
++	}
++
++	ro->src_addr = haddr;
++
++	ro->bound = 1;
++	err = 0;
++out_put:
++	dev_put(dev);
++out:
++	release_sock(sk);
++
++	return err;
++}
++
++static int dgram_ioctl(struct sock *sk, int cmd, unsigned long arg)
++{
++	switch (cmd) {
++	case SIOCOUTQ:
++	{
++		int amount = sk_wmem_alloc_get(sk);
++
++		return put_user(amount, (int __user *)arg);
++	}
++
++	case SIOCINQ:
++	{
++		struct sk_buff *skb;
++		unsigned long amount;
++
++		amount = 0;
++		spin_lock_bh(&sk->sk_receive_queue.lock);
++		skb = skb_peek(&sk->sk_receive_queue);
++		if (skb) {
++			/* We will only return the amount
++			 * of this packet since that is all
++			 * that will be read.
++			 */
++			amount = skb->len - ieee802154_hdr_length(skb);
++		}
++		spin_unlock_bh(&sk->sk_receive_queue.lock);
++		return put_user(amount, (int __user *)arg);
++	}
++	}
++
++	return -ENOIOCTLCMD;
++}
++
++/* FIXME: autobind */
++static int dgram_connect(struct sock *sk, struct sockaddr *uaddr,
++			 int len)
++{
++	struct sockaddr_ieee802154 *addr = (struct sockaddr_ieee802154 *)uaddr;
++	struct dgram_sock *ro = dgram_sk(sk);
++	int err = 0;
++
++	if (len < sizeof(*addr))
++		return -EINVAL;
++
++	if (addr->family != AF_IEEE802154)
++		return -EINVAL;
++
++	lock_sock(sk);
++
++	if (!ro->bound) {
++		err = -ENETUNREACH;
++		goto out;
++	}
++
++	ieee802154_addr_from_sa(&ro->dst_addr, &addr->addr);
++	ro->connected = 1;
++
++out:
++	release_sock(sk);
++	return err;
++}
++
++static int dgram_disconnect(struct sock *sk, int flags)
++{
++	struct dgram_sock *ro = dgram_sk(sk);
++
++	lock_sock(sk);
++	ro->connected = 0;
++	release_sock(sk);
++
++	return 0;
++}
++
++static int dgram_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
++{
++	struct net_device *dev;
++	unsigned int mtu;
++	struct sk_buff *skb;
++	struct ieee802154_mac_cb *cb;
++	struct dgram_sock *ro = dgram_sk(sk);
++	struct ieee802154_addr dst_addr;
++	int hlen, tlen;
++	int err;
++
++	if (msg->msg_flags & MSG_OOB) {
++		pr_debug("msg->msg_flags = 0x%x\n", msg->msg_flags);
++		return -EOPNOTSUPP;
++	}
++
++	if (!ro->connected && !msg->msg_name)
++		return -EDESTADDRREQ;
++	else if (ro->connected && msg->msg_name)
++		return -EISCONN;
++
++	if (!ro->bound)
++		dev = dev_getfirstbyhwtype(sock_net(sk), ARPHRD_IEEE802154);
++	else
++		dev = ieee802154_get_dev(sock_net(sk), &ro->src_addr);
++
++	if (!dev) {
++		pr_debug("no dev\n");
++		err = -ENXIO;
++		goto out;
++	}
++	mtu = dev->mtu;
++	pr_debug("name = %s, mtu = %u\n", dev->name, mtu);
++
++	if (size > mtu) {
++		pr_debug("size = %Zu, mtu = %u\n", size, mtu);
++		err = -EMSGSIZE;
++		goto out_dev;
++	}
++
++	hlen = LL_RESERVED_SPACE(dev);
++	tlen = dev->needed_tailroom;
++	skb = sock_alloc_send_skb(sk, hlen + tlen + size,
++				  msg->msg_flags & MSG_DONTWAIT,
++				  &err);
++	if (!skb)
++		goto out_dev;
++
++	skb_reserve(skb, hlen);
++
++	skb_reset_network_header(skb);
++
++	cb = mac_cb_init(skb);
++	cb->type = IEEE802154_FC_TYPE_DATA;
++	cb->ackreq = ro->want_ack;
++
++	if (msg->msg_name) {
++		DECLARE_SOCKADDR(struct sockaddr_ieee802154*,
++				 daddr, msg->msg_name);
++
++		ieee802154_addr_from_sa(&dst_addr, &daddr->addr);
++	} else {
++		dst_addr = ro->dst_addr;
++	}
++
++	cb->secen = ro->secen;
++	cb->secen_override = ro->secen_override;
++	cb->seclevel = ro->seclevel;
++	cb->seclevel_override = ro->seclevel_override;
++
++	err = dev_hard_header(skb, dev, ETH_P_IEEE802154, &dst_addr,
++			      ro->bound ? &ro->src_addr : NULL, size);
++	if (err < 0)
++		goto out_skb;
++
++	err = memcpy_from_msg(skb_put(skb, size), msg, size);
++	if (err < 0)
++		goto out_skb;
++
++	skb->dev = dev;
++	skb->sk  = sk;
++	skb->protocol = htons(ETH_P_IEEE802154);
++
++	dev_put(dev);
++
++	err = dev_queue_xmit(skb);
++	if (err > 0)
++		err = net_xmit_errno(err);
++
++	return err ?: size;
++
++out_skb:
++	kfree_skb(skb);
++out_dev:
++	dev_put(dev);
++out:
++	return err;
++}
++
++static int dgram_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
++			 int noblock, int flags, int *addr_len)
++{
++	size_t copied = 0;
++	int err = -EOPNOTSUPP;
++	struct sk_buff *skb;
++	DECLARE_SOCKADDR(struct sockaddr_ieee802154 *, saddr, msg->msg_name);
++
++	skb = skb_recv_datagram(sk, flags, noblock, &err);
++	if (!skb)
++		goto out;
++
++	copied = skb->len;
++	if (len < copied) {
++		msg->msg_flags |= MSG_TRUNC;
++		copied = len;
++	}
++
++	/* FIXME: skip headers if necessary ?! */
++	err = skb_copy_datagram_msg(skb, 0, msg, copied);
++	if (err)
++		goto done;
++
++	sock_recv_ts_and_drops(msg, sk, skb);
++
++	if (saddr) {
++		/* Clear the implicit padding in struct sockaddr_ieee802154
++		 * (16 bits between 'family' and 'addr') and in struct
++		 * ieee802154_addr_sa (16 bits at the end of the structure).
++		 */
++		memset(saddr, 0, sizeof(*saddr));
++
++		saddr->family = AF_IEEE802154;
++		ieee802154_addr_to_sa(&saddr->addr, &mac_cb(skb)->source);
++		*addr_len = sizeof(*saddr);
++	}
++
++	if (flags & MSG_TRUNC)
++		copied = skb->len;
++done:
++	skb_free_datagram(sk, skb);
++out:
++	if (err)
++		return err;
++	return copied;
++}
++
++static int dgram_rcv_skb(struct sock *sk, struct sk_buff *skb)
++{
++	skb = skb_share_check(skb, GFP_ATOMIC);
++	if (!skb)
++		return NET_RX_DROP;
++
++	if (sock_queue_rcv_skb(sk, skb) < 0) {
++		kfree_skb(skb);
++		return NET_RX_DROP;
++	}
++
++	return NET_RX_SUCCESS;
++}
++
++static inline bool
++ieee802154_match_sock(__le64 hw_addr, __le16 pan_id, __le16 short_addr,
++		      struct dgram_sock *ro)
++{
++	if (!ro->bound)
++		return true;
++
++	if (ro->src_addr.mode == IEEE802154_ADDR_LONG &&
++	    hw_addr == ro->src_addr.extended_addr)
++		return true;
++
++	if (ro->src_addr.mode == IEEE802154_ADDR_SHORT &&
++	    pan_id == ro->src_addr.pan_id &&
++	    short_addr == ro->src_addr.short_addr)
++		return true;
++
++	return false;
++}
++
++static int ieee802154_dgram_deliver(struct net_device *dev, struct sk_buff *skb)
++{
++	struct sock *sk, *prev = NULL;
++	int ret = NET_RX_SUCCESS;
++	__le16 pan_id, short_addr;
++	__le64 hw_addr;
++
++	/* Data frame processing */
++	BUG_ON(dev->type != ARPHRD_IEEE802154);
++
++	pan_id = dev->ieee802154_ptr->pan_id;
++	short_addr = dev->ieee802154_ptr->short_addr;
++	hw_addr = dev->ieee802154_ptr->extended_addr;
++
++	read_lock(&dgram_lock);
++	sk_for_each(sk, &dgram_head) {
++		if (ieee802154_match_sock(hw_addr, pan_id, short_addr,
++					  dgram_sk(sk))) {
++			if (prev) {
++				struct sk_buff *clone;
++
++				clone = skb_clone(skb, GFP_ATOMIC);
++				if (clone)
++					dgram_rcv_skb(prev, clone);
++			}
++
++			prev = sk;
++		}
++	}
++
++	if (prev) {
++		dgram_rcv_skb(prev, skb);
++	} else {
++		kfree_skb(skb);
++		ret = NET_RX_DROP;
++	}
++	read_unlock(&dgram_lock);
++
++	return ret;
++}
++
++static int dgram_getsockopt(struct sock *sk, int level, int optname,
++			    char __user *optval, int __user *optlen)
++{
++	struct dgram_sock *ro = dgram_sk(sk);
++
++	int val, len;
++
++	if (level != SOL_IEEE802154)
++		return -EOPNOTSUPP;
++
++	if (get_user(len, optlen))
++		return -EFAULT;
++
++	len = min_t(unsigned int, len, sizeof(int));
++
++	switch (optname) {
++	case WPAN_WANTACK:
++		val = ro->want_ack;
++		break;
++	case WPAN_SECURITY:
++		if (!ro->secen_override)
++			val = WPAN_SECURITY_DEFAULT;
++		else if (ro->secen)
++			val = WPAN_SECURITY_ON;
++		else
++			val = WPAN_SECURITY_OFF;
++		break;
++	case WPAN_SECURITY_LEVEL:
++		if (!ro->seclevel_override)
++			val = WPAN_SECURITY_LEVEL_DEFAULT;
++		else
++			val = ro->seclevel;
++		break;
++	default:
++		return -ENOPROTOOPT;
++	}
++
++	if (put_user(len, optlen))
++		return -EFAULT;
++	if (copy_to_user(optval, &val, len))
++		return -EFAULT;
++	return 0;
++}
++
++static int dgram_setsockopt(struct sock *sk, int level, int optname,
++			    char __user *optval, unsigned int optlen)
++{
++	struct dgram_sock *ro = dgram_sk(sk);
++	struct net *net = sock_net(sk);
++	int val;
++	int err = 0;
++
++	if (optlen < sizeof(int))
++		return -EINVAL;
++
++	if (get_user(val, (int __user *)optval))
++		return -EFAULT;
++
++	lock_sock(sk);
++
++	switch (optname) {
++	case WPAN_WANTACK:
++		ro->want_ack = !!val;
++		break;
++	case WPAN_SECURITY:
++		if (!ns_capable(net->user_ns, CAP_NET_ADMIN) &&
++		    !ns_capable(net->user_ns, CAP_NET_RAW)) {
++			err = -EPERM;
++			break;
++		}
++
++		switch (val) {
++		case WPAN_SECURITY_DEFAULT:
++			ro->secen_override = 0;
++			break;
++		case WPAN_SECURITY_ON:
++			ro->secen_override = 1;
++			ro->secen = 1;
++			break;
++		case WPAN_SECURITY_OFF:
++			ro->secen_override = 1;
++			ro->secen = 0;
++			break;
++		default:
++			err = -EINVAL;
++			break;
++		}
++		break;
++	case WPAN_SECURITY_LEVEL:
++		if (!ns_capable(net->user_ns, CAP_NET_ADMIN) &&
++		    !ns_capable(net->user_ns, CAP_NET_RAW)) {
++			err = -EPERM;
++			break;
++		}
++
++		if (val < WPAN_SECURITY_LEVEL_DEFAULT ||
++		    val > IEEE802154_SCF_SECLEVEL_ENC_MIC128) {
++			err = -EINVAL;
++		} else if (val == WPAN_SECURITY_LEVEL_DEFAULT) {
++			ro->seclevel_override = 0;
++		} else {
++			ro->seclevel_override = 1;
++			ro->seclevel = val;
++		}
++		break;
++	default:
++		err = -ENOPROTOOPT;
++		break;
++	}
++
++	release_sock(sk);
++	return err;
++}
++
++static struct proto ieee802154_dgram_prot = {
++	.name		= "IEEE-802.15.4-MAC",
++	.owner		= THIS_MODULE,
++	.obj_size	= sizeof(struct dgram_sock),
++	.init		= dgram_init,
++	.close		= dgram_close,
++	.bind		= dgram_bind,
++	.sendmsg	= dgram_sendmsg,
++	.recvmsg	= dgram_recvmsg,
++	.hash		= dgram_hash,
++	.unhash		= dgram_unhash,
++	.connect	= dgram_connect,
++	.disconnect	= dgram_disconnect,
++	.ioctl		= dgram_ioctl,
++	.getsockopt	= dgram_getsockopt,
++	.setsockopt	= dgram_setsockopt,
++};
++
++static const struct proto_ops ieee802154_dgram_ops = {
++	.family		   = PF_IEEE802154,
++	.owner		   = THIS_MODULE,
++	.release	   = ieee802154_sock_release,
++	.bind		   = ieee802154_sock_bind,
++	.connect	   = ieee802154_sock_connect,
++	.socketpair	   = sock_no_socketpair,
++	.accept		   = sock_no_accept,
++	.getname	   = sock_no_getname,
++	.poll		   = datagram_poll,
++	.ioctl		   = ieee802154_sock_ioctl,
++	.listen		   = sock_no_listen,
++	.shutdown	   = sock_no_shutdown,
++	.setsockopt	   = sock_common_setsockopt,
++	.getsockopt	   = sock_common_getsockopt,
++	.sendmsg	   = ieee802154_sock_sendmsg,
++	.recvmsg	   = sock_common_recvmsg,
++	.mmap		   = sock_no_mmap,
++	.sendpage	   = sock_no_sendpage,
++#ifdef CONFIG_COMPAT
++	.compat_setsockopt = compat_sock_common_setsockopt,
++	.compat_getsockopt = compat_sock_common_getsockopt,
++#endif
++};
++
++/* Create a socket. Initialise the socket, blank the addresses
++ * set the state.
++ */
++static int ieee802154_create(struct net *net, struct socket *sock,
++			     int protocol, int kern)
++{
++	struct sock *sk;
++	int rc;
++	struct proto *proto;
++	const struct proto_ops *ops;
++
++	if (!net_eq(net, &init_net))
++		return -EAFNOSUPPORT;
++
++	switch (sock->type) {
++	case SOCK_RAW:
++		proto = &ieee802154_raw_prot;
++		ops = &ieee802154_raw_ops;
++		break;
++	case SOCK_DGRAM:
++		proto = &ieee802154_dgram_prot;
++		ops = &ieee802154_dgram_ops;
++		break;
++	default:
++		rc = -ESOCKTNOSUPPORT;
++		goto out;
++	}
++
++	rc = -ENOMEM;
++	sk = sk_alloc(net, PF_IEEE802154, GFP_KERNEL, proto, kern);
++	if (!sk)
++		goto out;
++	rc = 0;
++
++	sock->ops = ops;
++
++	sock_init_data(sock, sk);
++	/* FIXME: sk->sk_destruct */
++	sk->sk_family = PF_IEEE802154;
++
++	/* Checksums on by default */
++	sock_set_flag(sk, SOCK_ZAPPED);
++
++	if (sk->sk_prot->hash)
++		sk->sk_prot->hash(sk);
++
++	if (sk->sk_prot->init) {
++		rc = sk->sk_prot->init(sk);
++		if (rc)
++			sk_common_release(sk);
++	}
++out:
++	return rc;
++}
++
++static const struct net_proto_family ieee802154_family_ops = {
++	.family		= PF_IEEE802154,
++	.create		= ieee802154_create,
++	.owner		= THIS_MODULE,
++};
++
++static int ieee802154_rcv(struct sk_buff *skb, struct net_device *dev,
++			  struct packet_type *pt, struct net_device *orig_dev)
++{
++	if (!netif_running(dev))
++		goto drop;
++	pr_debug("got frame, type %d, dev %p\n", dev->type, dev);
++#ifdef DEBUG
++	print_hex_dump_bytes("ieee802154_rcv ",
++			     DUMP_PREFIX_NONE, skb->data, skb->len);
++#endif
++
++	if (!net_eq(dev_net(dev), &init_net))
++		goto drop;
++
++	ieee802154_raw_deliver(dev, skb);
++
++	if (dev->type != ARPHRD_IEEE802154)
++		goto drop;
++
++	if (skb->pkt_type != PACKET_OTHERHOST)
++		return ieee802154_dgram_deliver(dev, skb);
++
++drop:
++	kfree_skb(skb);
++	return NET_RX_DROP;
++}
++
++static struct packet_type ieee802154_packet_type = {
++	.type = htons(ETH_P_IEEE802154),
++	.func = ieee802154_rcv,
++};
++
++static int __init af_ieee802154_init(void)
++{
++	int rc = -EINVAL;
++
++	rc = proto_register(&ieee802154_raw_prot, 1);
++	if (rc)
++		goto out;
++
++	rc = proto_register(&ieee802154_dgram_prot, 1);
++	if (rc)
++		goto err_dgram;
++
++	/* Tell SOCKET that we are alive */
++	rc = sock_register(&ieee802154_family_ops);
++	if (rc)
++		goto err_sock;
++	dev_add_pack(&ieee802154_packet_type);
++
++	rc = 0;
++	goto out;
++
++err_sock:
++	proto_unregister(&ieee802154_dgram_prot);
++err_dgram:
++	proto_unregister(&ieee802154_raw_prot);
++out:
++	return rc;
++}
++
++static void __exit af_ieee802154_remove(void)
++{
++	dev_remove_pack(&ieee802154_packet_type);
++	sock_unregister(PF_IEEE802154);
++	proto_unregister(&ieee802154_dgram_prot);
++	proto_unregister(&ieee802154_raw_prot);
++}
++
++module_init(af_ieee802154_init);
++module_exit(af_ieee802154_remove);
++
++MODULE_LICENSE("GPL");
++MODULE_ALIAS_NETPROTO(PF_IEEE802154);
 diff -urN a/net/ieee802154/sysfs.c b/net/ieee802154/sysfs.c
 --- a/net/ieee802154/sysfs.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/sysfs.c	2015-06-03 16:51:05.623929112 +1200
-@@ -0,0 +1,79 @@
++++ b/net/ieee802154/sysfs.c	2015-07-09 11:34:32.305243405 +1200
+@@ -0,0 +1,117 @@
 +/* This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License version 2
 + * as published by the Free Software Foundation.
@@ -15269,11 +16890,13 @@ diff -urN a/net/ieee802154/sysfs.c b/net/ieee802154/sysfs.c
 + */
 +
 +#include <linux/device.h>
++#include <linux/rtnetlink.h>
 +
 +#include <net/cfg802154.h>
 +
 +#include "core.h"
 +#include "sysfs.h"
++#include "rdev-ops.h"
 +
 +static inline struct cfg802154_registered_device *
 +dev_to_rdev(struct device *dev)
@@ -15317,10 +16940,46 @@ diff -urN a/net/ieee802154/sysfs.c b/net/ieee802154/sysfs.c
 +};
 +ATTRIBUTE_GROUPS(pmib);
 +
++#ifdef CONFIG_PM_SLEEP
++static int wpan_phy_suspend(struct device *dev)
++{
++	struct cfg802154_registered_device *rdev = dev_to_rdev(dev);
++	int ret = 0;
++
++	if (rdev->ops->suspend) {
++		rtnl_lock();
++		ret = rdev_suspend(rdev);
++		rtnl_unlock();
++	}
++
++	return ret;
++}
++
++static int wpan_phy_resume(struct device *dev)
++{
++	struct cfg802154_registered_device *rdev = dev_to_rdev(dev);
++	int ret = 0;
++
++	if (rdev->ops->resume) {
++		rtnl_lock();
++		ret = rdev_resume(rdev);
++		rtnl_unlock();
++	}
++
++	return ret;
++}
++
++static SIMPLE_DEV_PM_OPS(wpan_phy_pm_ops, wpan_phy_suspend, wpan_phy_resume);
++#define WPAN_PHY_PM_OPS (&wpan_phy_pm_ops)
++#else
++#define WPAN_PHY_PM_OPS NULL
++#endif
++
 +struct class wpan_phy_class = {
 +	.name = "ieee802154",
 +	.dev_release = wpan_phy_release,
 +	.dev_groups = pmib_groups,
++	.pm = WPAN_PHY_PM_OPS,
 +};
 +
 +int wpan_phy_sysfs_init(void)
@@ -15334,7 +16993,7 @@ diff -urN a/net/ieee802154/sysfs.c b/net/ieee802154/sysfs.c
 +}
 diff -urN a/net/ieee802154/sysfs.h b/net/ieee802154/sysfs.h
 --- a/net/ieee802154/sysfs.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/sysfs.h	2015-06-03 16:51:05.627929112 +1200
++++ b/net/ieee802154/sysfs.h	2015-07-09 11:34:32.305243405 +1200
 @@ -0,0 +1,9 @@
 +#ifndef __IEEE802154_SYSFS_H
 +#define __IEEE802154_SYSFS_H
@@ -15347,7 +17006,7 @@ diff -urN a/net/ieee802154/sysfs.h b/net/ieee802154/sysfs.h
 +#endif /* __IEEE802154_SYSFS_H */
 diff -urN a/net/ieee802154/trace.c b/net/ieee802154/trace.c
 --- a/net/ieee802154/trace.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/trace.c	2015-06-03 16:51:05.631929112 +1200
++++ b/net/ieee802154/trace.c	2015-07-09 11:34:32.309245405 +1200
 @@ -0,0 +1,7 @@
 +#include <linux/module.h>
 +
@@ -15358,8 +17017,8 @@ diff -urN a/net/ieee802154/trace.c b/net/ieee802154/trace.c
 +#endif
 diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 --- a/net/ieee802154/trace.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/ieee802154/trace.h	2015-06-03 16:51:05.635929112 +1200
-@@ -0,0 +1,277 @@
++++ b/net/ieee802154/trace.h	2015-07-09 11:34:32.309245405 +1200
+@@ -0,0 +1,299 @@
 +/* Based on net/wireless/trace.h */
 +
 +#undef TRACE_SYSTEM
@@ -15402,6 +17061,28 @@ diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 + *			rdev->ops traces		     *
 + *************************************************************/
 +
++DECLARE_EVENT_CLASS(wpan_phy_only_evt,
++	TP_PROTO(struct wpan_phy *wpan_phy),
++	TP_ARGS(wpan_phy),
++	TP_STRUCT__entry(
++		WPAN_PHY_ENTRY
++	),
++	TP_fast_assign(
++		WPAN_PHY_ASSIGN;
++	),
++	TP_printk(WPAN_PHY_PR_FMT, WPAN_PHY_PR_ARG)
++);
++
++DEFINE_EVENT(wpan_phy_only_evt, 802154_rdev_suspend,
++	TP_PROTO(struct wpan_phy *wpan_phy),
++	TP_ARGS(wpan_phy)
++);
++
++DEFINE_EVENT(wpan_phy_only_evt, 802154_rdev_resume,
++	TP_PROTO(struct wpan_phy *wpan_phy),
++	TP_ARGS(wpan_phy)
++);
++
 +TRACE_EVENT(802154_rdev_add_virtual_intf,
 +	TP_PROTO(struct wpan_phy *wpan_phy, char *name,
 +		 enum nl802154_iftype type, __le64 extended_addr),
@@ -15418,7 +17099,7 @@ diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 +		__entry->type = type;
 +		__entry->extended_addr = extended_addr;
 +	),
-+	TP_printk(WPAN_PHY_PR_FMT ", virtual intf name: %s, type: %d, ea %llx",
++	TP_printk(WPAN_PHY_PR_FMT ", virtual intf name: %s, type: %d, extended addr: 0x%llx",
 +		  WPAN_PHY_PR_ARG, __get_str(vir_intf_name), __entry->type,
 +		  __le64_to_cpu(__entry->extended_addr))
 +);
@@ -15466,7 +17147,7 @@ diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 +		WPAN_PHY_ASSIGN;
 +		__entry->power = power;
 +	),
-+	TP_printk(WPAN_PHY_PR_FMT ", power: %d", WPAN_PHY_PR_ARG,
++	TP_printk(WPAN_PHY_PR_FMT ", mbm: %d", WPAN_PHY_PR_ARG,
 +		  __entry->power)
 +);
 +
@@ -15496,7 +17177,7 @@ diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 +		WPAN_PHY_ASSIGN;
 +		__entry->ed_level = ed_level;
 +	),
-+	TP_printk(WPAN_PHY_PR_FMT ", ed_level: %d", WPAN_PHY_PR_ARG,
++	TP_printk(WPAN_PHY_PR_FMT ", ed level: %d", WPAN_PHY_PR_ARG,
 +		  __entry->ed_level)
 +);
 +
@@ -15529,7 +17210,7 @@ diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 +	TP_PROTO(struct wpan_phy *wpan_phy, struct wpan_dev *wpan_dev,
 +		 __le16 le16arg),
 +	TP_ARGS(wpan_phy, wpan_dev, le16arg),
-+	TP_printk(WPAN_PHY_PR_FMT ", " WPAN_DEV_PR_FMT ", sa: 0x%04x",
++	TP_printk(WPAN_PHY_PR_FMT ", " WPAN_DEV_PR_FMT ", short addr: 0x%04x",
 +		  WPAN_PHY_PR_ARG, WPAN_DEV_PR_ARG,
 +		  __le16_to_cpu(__entry->le16arg))
 +);
@@ -15552,7 +17233,7 @@ diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 +	),
 +
 +	TP_printk(WPAN_PHY_PR_FMT ", " WPAN_DEV_PR_FMT
-+		  ", min be: %d, max_be: %d", WPAN_PHY_PR_ARG,
++		  ", min be: %d, max be: %d", WPAN_PHY_PR_ARG,
 +		  WPAN_DEV_PR_ARG, __entry->min_be, __entry->max_be)
 +);
 +
@@ -15638,7 +17319,7 @@ diff -urN a/net/ieee802154/trace.h b/net/ieee802154/trace.h
 +#define TRACE_INCLUDE_FILE trace
 +#include <trace/define_trace.h>
 diff -urN a/net/ieee802154/wpan-class.c b/net/ieee802154/wpan-class.c
---- a/net/ieee802154/wpan-class.c	2015-06-03 16:51:05.279929121 +1200
+--- a/net/ieee802154/wpan-class.c	2015-07-09 11:34:32.081131408 +1200
 +++ b/net/ieee802154/wpan-class.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,230 +0,0 @@
 -/*
@@ -15873,8 +17554,8 @@ diff -urN a/net/ieee802154/wpan-class.c b/net/ieee802154/wpan-class.c
 -
 diff -urN a/net/mac802154/cfg.c b/net/mac802154/cfg.c
 --- a/net/mac802154/cfg.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/mac802154/cfg.c	2015-06-03 16:51:05.643929112 +1200
-@@ -0,0 +1,242 @@
++++ b/net/mac802154/cfg.c	2015-07-09 11:34:32.313247405 +1200
+@@ -0,0 +1,292 @@
 +/* This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License version 2
 + * as published by the Free Software Foundation.
@@ -15920,6 +17601,49 @@ diff -urN a/net/mac802154/cfg.c b/net/mac802154/cfg.c
 +
 +	ieee802154_if_remove(sdata);
 +}
++
++#ifdef CONFIG_PM
++static int ieee802154_suspend(struct wpan_phy *wpan_phy)
++{
++	struct ieee802154_local *local = wpan_phy_priv(wpan_phy);
++
++	if (!local->open_count)
++		goto suspend;
++
++	ieee802154_stop_queue(&local->hw);
++	synchronize_net();
++
++	/* stop hardware - this must stop RX */
++	ieee802154_stop_device(local);
++
++suspend:
++	local->suspended = true;
++	return 0;
++}
++
++static int ieee802154_resume(struct wpan_phy *wpan_phy)
++{
++	struct ieee802154_local *local = wpan_phy_priv(wpan_phy);
++	int ret;
++
++	/* nothing to do if HW shouldn't run */
++	if (!local->open_count)
++		goto wake_up;
++
++	/* restart hardware */
++	ret = drv_start(local);
++	if (ret)
++		return ret;
++
++wake_up:
++	ieee802154_wake_queue(&local->hw);
++	local->suspended = false;
++	return 0;
++}
++#else
++#define ieee802154_suspend NULL
++#define ieee802154_resume NULL
++#endif
 +
 +static int
 +ieee802154_add_iface(struct wpan_phy *phy, const char *name,
@@ -16022,13 +17746,18 @@ diff -urN a/net/mac802154/cfg.c b/net/mac802154/cfg.c
 +ieee802154_set_pan_id(struct wpan_phy *wpan_phy, struct wpan_dev *wpan_dev,
 +		      __le16 pan_id)
 +{
++	int ret;
++
 +	ASSERT_RTNL();
 +
 +	if (wpan_dev->pan_id == pan_id)
 +		return 0;
 +
-+	wpan_dev->pan_id = pan_id;
-+	return 0;
++	ret = mac802154_wpan_update_llsec(wpan_dev->netdev);
++	if (!ret)
++		wpan_dev->pan_id = pan_id;
++
++	return ret;
 +}
 +
 +static int
@@ -16104,6 +17833,8 @@ diff -urN a/net/mac802154/cfg.c b/net/mac802154/cfg.c
 +const struct cfg802154_ops mac802154_config_ops = {
 +	.add_virtual_intf_deprecated = ieee802154_add_iface_deprecated,
 +	.del_virtual_intf_deprecated = ieee802154_del_iface_deprecated,
++	.suspend = ieee802154_suspend,
++	.resume = ieee802154_resume,
 +	.add_virtual_intf = ieee802154_add_iface,
 +	.del_virtual_intf = ieee802154_del_iface,
 +	.set_channel = ieee802154_set_channel,
@@ -16119,7 +17850,7 @@ diff -urN a/net/mac802154/cfg.c b/net/mac802154/cfg.c
 +};
 diff -urN a/net/mac802154/cfg.h b/net/mac802154/cfg.h
 --- a/net/mac802154/cfg.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/mac802154/cfg.h	2015-06-03 16:51:05.647929112 +1200
++++ b/net/mac802154/cfg.h	2015-07-09 11:34:32.317249405 +1200
 @@ -0,0 +1,9 @@
 +/* mac802154 configuration hooks for cfg802154
 + */
@@ -16132,8 +17863,8 @@ diff -urN a/net/mac802154/cfg.h b/net/mac802154/cfg.h
 +#endif /* __CFG_H */
 diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 --- a/net/mac802154/driver-ops.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/mac802154/driver-ops.h	2015-06-03 16:51:05.647929112 +1200
-@@ -0,0 +1,223 @@
++++ b/net/mac802154/driver-ops.h	2015-07-09 11:34:32.317249405 +1200
+@@ -0,0 +1,287 @@
 +#ifndef __MAC802154_DRIVER_OPS
 +#define __MAC802154_DRIVER_OPS
 +
@@ -16143,6 +17874,7 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +#include <net/mac802154.h>
 +
 +#include "ieee802154_i.h"
++#include "trace.h"
 +
 +static inline int
 +drv_xmit_async(struct ieee802154_local *local, struct sk_buff *skb)
@@ -16163,19 +17895,25 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +
 +static inline int drv_start(struct ieee802154_local *local)
 +{
++	int ret;
++
 +	might_sleep();
 +
++	trace_802154_drv_start(local);
 +	local->started = true;
 +	smp_mb();
-+
-+	return local->ops->start(&local->hw);
++	ret = local->ops->start(&local->hw);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline void drv_stop(struct ieee802154_local *local)
 +{
 +	might_sleep();
 +
++	trace_802154_drv_stop(local);
 +	local->ops->stop(&local->hw);
++	trace_802154_drv_return_void(local);
 +
 +	/* sync away all work on the tasklet before clearing started */
 +	tasklet_disable(&local->tasklet);
@@ -16189,13 +17927,20 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +static inline int
 +drv_set_channel(struct ieee802154_local *local, u8 page, u8 channel)
 +{
++	int ret;
++
 +	might_sleep();
 +
-+	return local->ops->set_channel(&local->hw, page, channel);
++	trace_802154_drv_set_channel(local, page, channel);
++	ret = local->ops->set_channel(&local->hw, page, channel);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int drv_set_tx_power(struct ieee802154_local *local, s32 mbm)
 +{
++	int ret;
++
 +	might_sleep();
 +
 +	if (!local->ops->set_txpower) {
@@ -16203,12 +17948,17 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +		return -EOPNOTSUPP;
 +	}
 +
-+	return local->ops->set_txpower(&local->hw, mbm);
++	trace_802154_drv_set_tx_power(local, mbm);
++	ret = local->ops->set_txpower(&local->hw, mbm);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int drv_set_cca_mode(struct ieee802154_local *local,
 +				   const struct wpan_phy_cca *cca)
 +{
++	int ret;
++
 +	might_sleep();
 +
 +	if (!local->ops->set_cca_mode) {
@@ -16216,11 +17966,16 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +		return -EOPNOTSUPP;
 +	}
 +
-+	return local->ops->set_cca_mode(&local->hw, cca);
++	trace_802154_drv_set_cca_mode(local, cca);
++	ret = local->ops->set_cca_mode(&local->hw, cca);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int drv_set_lbt_mode(struct ieee802154_local *local, bool mode)
 +{
++	int ret;
++
 +	might_sleep();
 +
 +	if (!local->ops->set_lbt) {
@@ -16228,12 +17983,17 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +		return -EOPNOTSUPP;
 +	}
 +
-+	return local->ops->set_lbt(&local->hw, mode);
++	trace_802154_drv_set_lbt_mode(local, mode);
++	ret = local->ops->set_lbt(&local->hw, mode);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int
 +drv_set_cca_ed_level(struct ieee802154_local *local, s32 mbm)
 +{
++	int ret;
++
 +	might_sleep();
 +
 +	if (!local->ops->set_cca_ed_level) {
@@ -16241,12 +18001,16 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +		return -EOPNOTSUPP;
 +	}
 +
-+	return local->ops->set_cca_ed_level(&local->hw, mbm);
++	trace_802154_drv_set_cca_ed_level(local, mbm);
++	ret = local->ops->set_cca_ed_level(&local->hw, mbm);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int drv_set_pan_id(struct ieee802154_local *local, __le16 pan_id)
 +{
 +	struct ieee802154_hw_addr_filt filt;
++	int ret;
 +
 +	might_sleep();
 +
@@ -16257,14 +18021,18 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +
 +	filt.pan_id = pan_id;
 +
-+	return local->ops->set_hw_addr_filt(&local->hw, &filt,
++	trace_802154_drv_set_pan_id(local, pan_id);
++	ret = local->ops->set_hw_addr_filt(&local->hw, &filt,
 +					    IEEE802154_AFILT_PANID_CHANGED);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int
 +drv_set_extended_addr(struct ieee802154_local *local, __le64 extended_addr)
 +{
 +	struct ieee802154_hw_addr_filt filt;
++	int ret;
 +
 +	might_sleep();
 +
@@ -16275,14 +18043,18 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +
 +	filt.ieee_addr = extended_addr;
 +
-+	return local->ops->set_hw_addr_filt(&local->hw, &filt,
++	trace_802154_drv_set_extended_addr(local, extended_addr);
++	ret = local->ops->set_hw_addr_filt(&local->hw, &filt,
 +					    IEEE802154_AFILT_IEEEADDR_CHANGED);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int
 +drv_set_short_addr(struct ieee802154_local *local, __le16 short_addr)
 +{
 +	struct ieee802154_hw_addr_filt filt;
++	int ret;
 +
 +	might_sleep();
 +
@@ -16293,14 +18065,18 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +
 +	filt.short_addr = short_addr;
 +
-+	return local->ops->set_hw_addr_filt(&local->hw, &filt,
++	trace_802154_drv_set_short_addr(local, short_addr);
++	ret = local->ops->set_hw_addr_filt(&local->hw, &filt,
 +					    IEEE802154_AFILT_SADDR_CHANGED);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int
 +drv_set_pan_coord(struct ieee802154_local *local, bool is_coord)
 +{
 +	struct ieee802154_hw_addr_filt filt;
++	int ret;
 +
 +	might_sleep();
 +
@@ -16311,14 +18087,19 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +
 +	filt.pan_coord = is_coord;
 +
-+	return local->ops->set_hw_addr_filt(&local->hw, &filt,
++	trace_802154_drv_set_pan_coord(local, is_coord);
++	ret = local->ops->set_hw_addr_filt(&local->hw, &filt,
 +					    IEEE802154_AFILT_PANC_CHANGED);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int
 +drv_set_csma_params(struct ieee802154_local *local, u8 min_be, u8 max_be,
 +		    u8 max_csma_backoffs)
 +{
++	int ret;
++
 +	might_sleep();
 +
 +	if (!local->ops->set_csma_params) {
@@ -16326,13 +18107,19 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +		return -EOPNOTSUPP;
 +	}
 +
-+	return local->ops->set_csma_params(&local->hw, min_be, max_be,
++	trace_802154_drv_set_csma_params(local, min_be, max_be,
++					 max_csma_backoffs);
++	ret = local->ops->set_csma_params(&local->hw, min_be, max_be,
 +					   max_csma_backoffs);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int
 +drv_set_max_frame_retries(struct ieee802154_local *local, s8 max_frame_retries)
 +{
++	int ret;
++
 +	might_sleep();
 +
 +	if (!local->ops->set_frame_retries) {
@@ -16340,12 +18127,17 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +		return -EOPNOTSUPP;
 +	}
 +
-+	return local->ops->set_frame_retries(&local->hw, max_frame_retries);
++	trace_802154_drv_set_max_frame_retries(local, max_frame_retries);
++	ret = local->ops->set_frame_retries(&local->hw, max_frame_retries);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +static inline int
 +drv_set_promiscuous_mode(struct ieee802154_local *local, bool on)
 +{
++	int ret;
++
 +	might_sleep();
 +
 +	if (!local->ops->set_promiscuous_mode) {
@@ -16353,12 +18145,15 @@ diff -urN a/net/mac802154/driver-ops.h b/net/mac802154/driver-ops.h
 +		return -EOPNOTSUPP;
 +	}
 +
-+	return local->ops->set_promiscuous_mode(&local->hw, on);
++	trace_802154_drv_set_promiscuous_mode(local, on);
++	ret = local->ops->set_promiscuous_mode(&local->hw, on);
++	trace_802154_drv_return_int(local, ret);
++	return ret;
 +}
 +
 +#endif /* __MAC802154_DRIVER_OPS */
 diff -urN a/net/mac802154/ieee802154_dev.c b/net/mac802154/ieee802154_dev.c
---- a/net/mac802154/ieee802154_dev.c	2015-06-03 16:51:05.299929120 +1200
+--- a/net/mac802154/ieee802154_dev.c	2015-07-09 11:34:32.113147408 +1200
 +++ b/net/mac802154/ieee802154_dev.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,415 +0,0 @@
 -/*
@@ -16778,8 +18573,8 @@ diff -urN a/net/mac802154/ieee802154_dev.c b/net/mac802154/ieee802154_dev.c
 -MODULE_LICENSE("GPL v2");
 diff -urN a/net/mac802154/ieee802154_i.h b/net/mac802154/ieee802154_i.h
 --- a/net/mac802154/ieee802154_i.h	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/mac802154/ieee802154_i.h	2015-06-03 16:51:05.655929112 +1200
-@@ -0,0 +1,182 @@
++++ b/net/mac802154/ieee802154_i.h	2015-07-09 11:34:32.325253405 +1200
+@@ -0,0 +1,183 @@
 +/*
 + * Copyright (C) 2007-2012 Siemens AG
 + *
@@ -16838,6 +18633,7 @@ diff -urN a/net/mac802154/ieee802154_i.h b/net/mac802154/ieee802154_i.h
 +	struct hrtimer ifs_timer;
 +
 +	bool started;
++	bool suspended;
 +
 +	struct tasklet_struct tasklet;
 +	struct sk_buff_head skb_queue;
@@ -16874,11 +18670,7 @@ diff -urN a/net/mac802154/ieee802154_i.h b/net/mac802154/ieee802154_i.h
 +	struct mutex sec_mtx;
 +
 +	struct mac802154_llsec sec;
-+	/* must be last, dynamically sized area in this! */
-+	struct ieee802154_vif vif;
 +};
-+
-+#define MAC802154_CHAN_NONE		0xff /* No channel is assigned */
 +
 +/* utility functions/constants */
 +extern const void *const mac802154_wpan_phy_privid; /*  for wpan_phy privid */
@@ -16909,6 +18701,7 @@ diff -urN a/net/mac802154/ieee802154_i.h b/net/mac802154/ieee802154_i.h
 +
 +extern struct ieee802154_mlme_ops mac802154_mlme_wpan;
 +
++void ieee802154_rx(struct ieee802154_local *local, struct sk_buff *skb);
 +netdev_tx_t
 +ieee802154_monitor_start_xmit(struct sk_buff *skb, struct net_device *dev);
 +netdev_tx_t
@@ -16951,6 +18744,8 @@ diff -urN a/net/mac802154/ieee802154_i.h b/net/mac802154/ieee802154_i.h
 +			 struct ieee802154_llsec_table **t);
 +void mac802154_unlock_table(struct net_device *dev);
 +
++int mac802154_wpan_update_llsec(struct net_device *dev);
++
 +/* interface handling */
 +int ieee802154_iface_init(void);
 +void ieee802154_iface_exit(void);
@@ -16960,12 +18755,13 @@ diff -urN a/net/mac802154/ieee802154_i.h b/net/mac802154/ieee802154_i.h
 +		  unsigned char name_assign_type, enum nl802154_iftype type,
 +		  __le64 extended_addr);
 +void ieee802154_remove_interfaces(struct ieee802154_local *local);
++void ieee802154_stop_device(struct ieee802154_local *local);
 +
 +#endif /* __IEEE802154_I_H */
 diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 --- a/net/mac802154/iface.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/mac802154/iface.c	2015-06-03 16:51:05.659929112 +1200
-@@ -0,0 +1,643 @@
++++ b/net/mac802154/iface.c	2015-07-09 11:34:32.325253405 +1200
+@@ -0,0 +1,651 @@
 +/*
 + * Copyright 2007-2012 Siemens AG
 + *
@@ -16998,7 +18794,7 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +#include "ieee802154_i.h"
 +#include "driver-ops.h"
 +
-+static int mac802154_wpan_update_llsec(struct net_device *dev)
++int mac802154_wpan_update_llsec(struct net_device *dev)
 +{
 +	struct ieee802154_sub_if_data *sdata = IEEE802154_DEV_TO_SUB_IF(dev);
 +	struct ieee802154_mlme_ops *ops = ieee802154_mlme_ops(dev);
@@ -17103,19 +18899,72 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +	return mac802154_wpan_update_llsec(dev);
 +}
 +
++static int ieee802154_setup_hw(struct ieee802154_sub_if_data *sdata)
++{
++	struct ieee802154_local *local = sdata->local;
++	struct wpan_dev *wpan_dev = &sdata->wpan_dev;
++	int ret;
++
++	if (local->hw.flags & IEEE802154_HW_PROMISCUOUS) {
++		ret = drv_set_promiscuous_mode(local,
++					       wpan_dev->promiscuous_mode);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (local->hw.flags & IEEE802154_HW_AFILT) {
++		ret = drv_set_pan_id(local, wpan_dev->pan_id);
++		if (ret < 0)
++			return ret;
++
++		ret = drv_set_extended_addr(local, wpan_dev->extended_addr);
++		if (ret < 0)
++			return ret;
++
++		ret = drv_set_short_addr(local, wpan_dev->short_addr);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (local->hw.flags & IEEE802154_HW_LBT) {
++		ret = drv_set_lbt_mode(local, wpan_dev->lbt);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (local->hw.flags & IEEE802154_HW_CSMA_PARAMS) {
++		ret = drv_set_csma_params(local, wpan_dev->min_be,
++					  wpan_dev->max_be,
++					  wpan_dev->csma_retries);
++		if (ret < 0)
++			return ret;
++	}
++
++	if (local->hw.flags & IEEE802154_HW_FRAME_RETRIES) {
++		ret = drv_set_max_frame_retries(local, wpan_dev->frame_retries);
++		if (ret < 0)
++			return ret;
++	}
++
++	return 0;
++}
++
 +static int mac802154_slave_open(struct net_device *dev)
 +{
 +	struct ieee802154_sub_if_data *sdata = IEEE802154_DEV_TO_SUB_IF(dev);
 +	struct ieee802154_local *local = sdata->local;
-+	int res = 0;
++	int res;
 +
 +	ASSERT_RTNL();
 +
 +	set_bit(SDATA_STATE_RUNNING, &sdata->state);
 +
 +	if (!local->open_count) {
++		res = ieee802154_setup_hw(sdata);
++		if (res)
++			goto err;
++
 +		res = drv_start(local);
-+		WARN_ON(res);
 +		if (res)
 +			goto err;
 +	}
@@ -17187,8 +19036,8 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +			 * exist really an use case if we need to support
 +			 * multiple node types at the same time.
 +			 */
-+			if (sdata->vif.type == NL802154_IFTYPE_NODE &&
-+			    nsdata->vif.type == NL802154_IFTYPE_NODE)
++			if (wpan_dev->iftype == NL802154_IFTYPE_NODE &&
++			    nsdata->wpan_dev.iftype == NL802154_IFTYPE_NODE)
 +				return -EBUSY;
 +
 +			/* check all phy mac sublayer settings are the same.
@@ -17208,60 +19057,13 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +{
 +	int rc;
 +	struct ieee802154_sub_if_data *sdata = IEEE802154_DEV_TO_SUB_IF(dev);
-+	struct ieee802154_local *local = sdata->local;
 +	struct wpan_dev *wpan_dev = &sdata->wpan_dev;
 +
-+	rc = ieee802154_check_concurrent_iface(sdata, sdata->vif.type);
++	rc = ieee802154_check_concurrent_iface(sdata, wpan_dev->iftype);
 +	if (rc < 0)
 +		return rc;
 +
-+	rc = mac802154_slave_open(dev);
-+	if (rc < 0)
-+		return rc;
-+
-+	if (local->hw.flags & IEEE802154_HW_PROMISCUOUS) {
-+		rc = drv_set_promiscuous_mode(local,
-+					      wpan_dev->promiscuous_mode);
-+		if (rc < 0)
-+			goto out;
-+	}
-+
-+	if (local->hw.flags & IEEE802154_HW_AFILT) {
-+		rc = drv_set_pan_id(local, wpan_dev->pan_id);
-+		if (rc < 0)
-+			goto out;
-+
-+		rc = drv_set_extended_addr(local, wpan_dev->extended_addr);
-+		if (rc < 0)
-+			goto out;
-+
-+		rc = drv_set_short_addr(local, wpan_dev->short_addr);
-+		if (rc < 0)
-+			goto out;
-+	}
-+
-+	if (local->hw.flags & IEEE802154_HW_LBT) {
-+		rc = drv_set_lbt_mode(local, wpan_dev->lbt);
-+		if (rc < 0)
-+			goto out;
-+	}
-+
-+	if (local->hw.flags & IEEE802154_HW_CSMA_PARAMS) {
-+		rc = drv_set_csma_params(local, wpan_dev->min_be,
-+					 wpan_dev->max_be,
-+					 wpan_dev->csma_retries);
-+		if (rc < 0)
-+			goto out;
-+	}
-+
-+	if (local->hw.flags & IEEE802154_HW_FRAME_RETRIES) {
-+		rc = drv_set_max_frame_retries(local, wpan_dev->frame_retries);
-+		if (rc < 0)
-+			goto out;
-+	}
-+
-+out:
-+	return rc;
++	return mac802154_slave_open(dev);
 +}
 +
 +static int mac802154_slave_close(struct net_device *dev)
@@ -17271,15 +19073,13 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +
 +	ASSERT_RTNL();
 +
-+	hrtimer_cancel(&local->ifs_timer);
-+
 +	netif_stop_queue(dev);
 +	local->open_count--;
 +
 +	clear_bit(SDATA_STATE_RUNNING, &sdata->state);
 +
 +	if (!local->open_count)
-+		drv_stop(local);
++		ieee802154_stop_device(local);
 +
 +	return 0;
 +}
@@ -17432,10 +19232,10 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +		       enum nl802154_iftype type)
 +{
 +	struct wpan_dev *wpan_dev = &sdata->wpan_dev;
++	int ret;
 +	u8 tmp;
 +
 +	/* set some type-dependent values */
-+	sdata->vif.type = type;
 +	sdata->wpan_dev.iftype = type;
 +
 +	get_random_bytes(&tmp, sizeof(tmp));
@@ -17467,6 +19267,10 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +		mutex_init(&sdata->sec_mtx);
 +
 +		mac802154_llsec_init(&sdata->sec);
++		ret = mac802154_wpan_update_llsec(sdata->dev);
++		if (ret < 0)
++			return ret;
++
 +		break;
 +	case NL802154_IFTYPE_MONITOR:
 +		sdata->dev->destructor = free_netdev;
@@ -17491,7 +19295,7 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +
 +	ASSERT_RTNL();
 +
-+	ndev = alloc_netdev(sizeof(*sdata) + local->hw.vif_data_size, name,
++	ndev = alloc_netdev(sizeof(*sdata), name,
 +			    name_assign_type, ieee802154_if_setup);
 +	if (!ndev)
 +		return ERR_PTR(-ENOMEM);
@@ -17610,8 +19414,8 @@ diff -urN a/net/mac802154/iface.c b/net/mac802154/iface.c
 +	unregister_netdevice_notifier(&mac802154_netdev_notifier);
 +}
 diff -urN a/net/mac802154/Kconfig b/net/mac802154/Kconfig
---- a/net/mac802154/Kconfig	2015-06-03 16:51:05.307929120 +1200
-+++ b/net/mac802154/Kconfig	2015-06-03 16:51:05.659929112 +1200
+--- a/net/mac802154/Kconfig	2015-07-09 11:34:32.121151409 +1200
++++ b/net/mac802154/Kconfig	2015-07-09 11:34:32.329255405 +1200
 @@ -2,6 +2,7 @@
  	tristate "Generic IEEE 802.15.4 Soft Networking Stack (mac802154)"
  	depends on IEEE802154
@@ -17628,8 +19432,8 @@ diff -urN a/net/mac802154/Kconfig b/net/mac802154/Kconfig
 +	  say N here. Alternatively you can say M to compile it as
  	  module.
 diff -urN a/net/mac802154/llsec.c b/net/mac802154/llsec.c
---- a/net/mac802154/llsec.c	2015-06-03 16:51:05.311929120 +1200
-+++ b/net/mac802154/llsec.c	2015-06-03 16:51:05.663929111 +1200
+--- a/net/mac802154/llsec.c	2015-07-09 11:34:32.125153407 +1200
++++ b/net/mac802154/llsec.c	2015-07-09 11:34:32.329255405 +1200
 @@ -17,10 +17,10 @@
  #include <linux/err.h>
  #include <linux/bug.h>
@@ -17738,6 +19542,52 @@ diff -urN a/net/mac802154/llsec.c b/net/mac802154/llsec.c
  static void llsec_geniv(u8 iv[16], __le64 addr,
  			const struct ieee802154_sechdr *sec)
  {
+@@ -661,7 +648,8 @@
+ {
+ 	u8 iv[16];
+ 	unsigned char *data;
+-	int authlen, assoclen, datalen, rc;
++	int authlen, datalen, rc;
++	int assoclen = 0;
+ 	struct scatterlist src, assoc[2], dst[2];
+ 	struct aead_request *req;
+ 
+@@ -672,26 +660,25 @@
+ 	if (!req)
+ 		return -ENOMEM;
+ 
+-	sg_init_table(assoc, 2);
+-	sg_set_buf(&assoc[0], skb_mac_header(skb), skb->mac_len);
+-	assoclen = skb->mac_len;
+-
+ 	data = skb_mac_header(skb) + skb->mac_len;
+ 	datalen = skb_tail_pointer(skb) - data;
+ 
+ 	if (hdr->sec.level & IEEE802154_SCF_SECLEVEL_ENC) {
+-		sg_set_buf(&assoc[1], data, 0);
++		sg_init_table(assoc, 1);
++		sg_init_table(dst, 2);
++		sg_set_buf(&dst[0], data, datalen);
++		sg_set_buf(&dst[1], skb_put(skb, authlen), authlen);
++		sg_init_one(&src, data, datalen);
+ 	} else {
++		sg_init_table(assoc, 2);
+ 		sg_set_buf(&assoc[1], data, datalen);
+ 		assoclen += datalen;
+ 		datalen = 0;
++		sg_init_one(dst, skb_put(skb, authlen), authlen);
+ 	}
+ 
+-	sg_init_one(&src, data, datalen);
+-
+-	sg_init_table(dst, 2);
+-	sg_set_buf(&dst[0], data, datalen);
+-	sg_set_buf(&dst[1], skb_put(skb, authlen), authlen);
++	sg_set_buf(&assoc[0], skb_mac_header(skb), skb->mac_len);
++	assoclen += skb->mac_len;
+ 
+ 	aead_request_set_callback(req, 0, NULL, NULL);
+ 	aead_request_set_assoc(req, assoc, assoclen);
 @@ -786,8 +773,6 @@
  	return rc;
  }
@@ -17748,7 +19598,7 @@ diff -urN a/net/mac802154/llsec.c b/net/mac802154/llsec.c
  llsec_lookup_dev(struct mac802154_llsec *sec,
  		 const struct ieee802154_addr *addr)
 diff -urN a/net/mac802154/mac802154.h b/net/mac802154/mac802154.h
---- a/net/mac802154/mac802154.h	2015-06-03 16:51:05.323929120 +1200
+--- a/net/mac802154/mac802154.h	2015-07-09 11:34:32.125153407 +1200
 +++ b/net/mac802154/mac802154.h	1970-01-01 12:00:00.000000000 +1200
 @@ -1,172 +0,0 @@
 -/*
@@ -17924,8 +19774,8 @@ diff -urN a/net/mac802154/mac802154.h b/net/mac802154/mac802154.h
 -
 -#endif /* MAC802154_H */
 diff -urN a/net/mac802154/mac_cmd.c b/net/mac802154/mac_cmd.c
---- a/net/mac802154/mac_cmd.c	2015-06-03 16:51:05.327929120 +1200
-+++ b/net/mac802154/mac_cmd.c	2015-06-03 16:51:05.671929111 +1200
+--- a/net/mac802154/mac_cmd.c	2015-07-09 11:34:32.129155407 +1200
++++ b/net/mac802154/mac_cmd.c	2015-07-09 11:34:32.333257405 +1200
 @@ -12,10 +12,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -18096,8 +19946,8 @@ diff -urN a/net/mac802154/mac_cmd.c b/net/mac802154/mac_cmd.c
  
 diff -urN a/net/mac802154/main.c b/net/mac802154/main.c
 --- a/net/mac802154/main.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/mac802154/main.c	2015-06-03 16:51:05.675929111 +1200
-@@ -0,0 +1,252 @@
++++ b/net/mac802154/main.c	2015-07-09 11:34:32.337259405 +1200
+@@ -0,0 +1,250 @@
 +/*
 + * Copyright (C) 2007-2012 Siemens AG
 + *
@@ -18140,7 +19990,7 @@ diff -urN a/net/mac802154/main.c b/net/mac802154/main.c
 +			 * netstack.
 +			 */
 +			skb->pkt_type = 0;
-+			ieee802154_rx(&local->hw, skb);
++			ieee802154_rx(local, skb);
 +			break;
 +		default:
 +			WARN(1, "mac802154: Packet is of unknown type %d\n",
@@ -18158,11 +20008,9 @@ diff -urN a/net/mac802154/main.c b/net/mac802154/main.c
 +	struct ieee802154_local *local;
 +	size_t priv_size;
 +
-+	if (!ops || !(ops->xmit_async || ops->xmit_sync) || !ops->ed ||
-+	    !ops->start || !ops->stop || !ops->set_channel) {
-+		pr_err("undefined IEEE802.15.4 device operations\n");
++	if (WARN_ON(!ops || !(ops->xmit_async || ops->xmit_sync) || !ops->ed ||
++		    !ops->start || !ops->stop || !ops->set_channel))
 +		return NULL;
-+	}
 +
 +	/* Ensure 32-byte alignment of our private data and hw private data.
 +	 * We use the wpan_phy priv data for both our ieee802154_local and for
@@ -18351,19 +20199,21 @@ diff -urN a/net/mac802154/main.c b/net/mac802154/main.c
 +MODULE_DESCRIPTION("IEEE 802.15.4 subsystem");
 +MODULE_LICENSE("GPL v2");
 diff -urN a/net/mac802154/Makefile b/net/mac802154/Makefile
---- a/net/mac802154/Makefile	2015-06-03 16:51:05.331929119 +1200
-+++ b/net/mac802154/Makefile	2015-06-03 16:51:05.679929111 +1200
-@@ -1,5 +1,5 @@
+--- a/net/mac802154/Makefile	2015-07-09 11:34:32.141161407 +1200
++++ b/net/mac802154/Makefile	2015-07-09 11:34:32.341261406 +1200
+@@ -1,5 +1,7 @@
  obj-$(CONFIG_MAC802154)	+= mac802154.o
 -mac802154-objs		:= ieee802154_dev.o rx.o tx.o mac_cmd.o mib.o \
 -			   monitor.o wpan.o llsec.o
 +mac802154-objs		:= main.o rx.o tx.o mac_cmd.o mib.o \
-+			   iface.o llsec.o util.o cfg.o
++			   iface.o llsec.o util.o cfg.o trace.o
++
++CFLAGS_trace.o := -I$(src)
  
  ccflags-y += -D__CHECK_ENDIAN__
 diff -urN a/net/mac802154/mib.c b/net/mac802154/mib.c
---- a/net/mac802154/mib.c	2015-06-03 16:51:05.335929119 +1200
-+++ b/net/mac802154/mib.c	2015-06-03 16:51:05.679929111 +1200
+--- a/net/mac802154/mib.c	2015-07-09 11:34:32.145163407 +1200
++++ b/net/mac802154/mib.c	2015-07-09 11:34:32.341261406 +1200
 @@ -10,10 +10,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -18810,7 +20660,7 @@ diff -urN a/net/mac802154/mib.c b/net/mac802154/mib.c
 +	mutex_unlock(&sdata->sec_mtx);
  }
 diff -urN a/net/mac802154/monitor.c b/net/mac802154/monitor.c
---- a/net/mac802154/monitor.c	2015-06-03 16:51:05.339929119 +1200
+--- a/net/mac802154/monitor.c	2015-07-09 11:34:32.149165408 +1200
 +++ b/net/mac802154/monitor.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,117 +0,0 @@
 -/*
@@ -18931,8 +20781,8 @@ diff -urN a/net/mac802154/monitor.c b/net/mac802154/monitor.c
 -	priv->page = 0;
 -}
 diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
---- a/net/mac802154/rx.c	2015-06-03 16:51:05.343929119 +1200
-+++ b/net/mac802154/rx.c	2015-06-03 16:51:05.687929111 +1200
+--- a/net/mac802154/rx.c	2015-07-09 11:34:32.149165408 +1200
++++ b/net/mac802154/rx.c	2015-07-09 11:34:32.345263405 +1200
 @@ -10,10 +10,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -18944,7 +20794,7 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
   * Written by:
   * Pavel Smolenskiy <pavel.smolenskiy@gmail.com>
   * Maxim Gorbachyov <maxim.gorbachev@siemens.com>
-@@ -23,92 +19,279 @@
+@@ -23,92 +19,285 @@
  
  #include <linux/kernel.h>
  #include <linux/module.h>
@@ -18993,17 +20843,7 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 -		u16 crc;
 +	return netif_receive_skb(skb);
 +}
- 
--		if (skb->len < 2) {
--			pr_debug("got invalid frame\n");
--			goto fail;
--		}
--		crc = crc_ccitt(0, skb->data, skb->len);
--		if (crc) {
--			pr_debug("CRC mismatch\n");
--			goto fail;
--		}
--		skb_trim(skb, skb->len - 2); /* CRC */
++
 +static int
 +ieee802154_subif_frame(struct ieee802154_sub_if_data *sdata,
 +		       struct sk_buff *skb, const struct ieee802154_hdr *hdr)
@@ -19050,22 +20890,32 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 +	default:
 +		pr_debug("invalid dest mode\n");
 +		goto fail;
- 	}
++	}
  
--	mac802154_monitors_rx(priv, skb);
--	mac802154_wpans_rx(priv, skb);
+-		if (skb->len < 2) {
+-			pr_debug("got invalid frame\n");
+-			goto fail;
+-		}
+-		crc = crc_ccitt(0, skb->data, skb->len);
+-		if (crc) {
+-			pr_debug("CRC mismatch\n");
+-			goto fail;
+-		}
+-		skb_trim(skb, skb->len - 2); /* CRC */
 +	skb->dev = sdata->dev;
 +
 +	rc = mac802154_llsec_decrypt(&sdata->sec, skb);
 +	if (rc) {
 +		pr_debug("decryption failed: %i\n", rc);
 +		goto fail;
-+	}
+ 	}
  
--	return;
+-	mac802154_monitors_rx(priv, skb);
+-	mac802154_wpans_rx(priv, skb);
 +	sdata->dev->stats.rx_packets++;
 +	sdata->dev->stats.rx_bytes += skb->len;
-+
+ 
+-	return;
 +	switch (mac_cb(skb)->type) {
 +	case IEEE802154_FC_TYPE_DATA:
 +		return ieee802154_deliver_skb(skb);
@@ -19087,16 +20937,16 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 -	struct rx_work *rw = container_of(work, struct rx_work, work);
 +	if (addr->mode == IEEE802154_ADDR_NONE)
 +		pr_debug("%s not present\n", name);
- 
--	mac802154_subif_rx(rw->dev, rw->skb, rw->lqi);
--	kfree(rw);
++
 +	pr_debug("%s PAN ID: %04x\n", name, le16_to_cpu(addr->pan_id));
 +	if (addr->mode == IEEE802154_ADDR_SHORT) {
 +		pr_debug("%s is short: %04x\n", name,
 +			 le16_to_cpu(addr->short_addr));
 +	} else {
 +		u64 hw = swab64((__force u64)addr->extended_addr);
-+
+ 
+-	mac802154_subif_rx(rw->dev, rw->skb, rw->lqi);
+-	kfree(rw);
 +		pr_debug("%s is hardware: %8phC\n", name, &hw);
 +	}
  }
@@ -19184,19 +21034,26 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 +	}
 +
 +	list_for_each_entry_rcu(sdata, &local->interfaces, list) {
-+		if (sdata->vif.type != NL802154_IFTYPE_NODE ||
-+		    !netif_running(sdata->dev))
++		if (sdata->wpan_dev.iftype != NL802154_IFTYPE_NODE)
++			continue;
++
++		if (!ieee802154_sdata_running(sdata))
 +			continue;
 +
 +		ieee802154_subif_frame(sdata, skb, &hdr);
 +		skb = NULL;
 +		break;
 +	}
-+
+ 
+-	INIT_WORK(&work->work, mac802154_rx_worker);
+-	work->skb = skb;
+-	work->dev = dev;
+-	work->lqi = lqi;
 +	if (skb)
 +		kfree_skb(skb);
 +}
-+
+ 
+-	queue_work(priv->dev_workqueue, &work->work);
 +static void
 +ieee802154_monitors_rx(struct ieee802154_local *local, struct sk_buff *skb)
 +{
@@ -19207,13 +21064,9 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 +	skb->ip_summed = CHECKSUM_UNNECESSARY;
 +	skb->pkt_type = PACKET_OTHERHOST;
 +	skb->protocol = htons(ETH_P_IEEE802154);
- 
--	INIT_WORK(&work->work, mac802154_rx_worker);
--	work->skb = skb;
--	work->dev = dev;
--	work->lqi = lqi;
++
 +	list_for_each_entry_rcu(sdata, &local->interfaces, list) {
-+		if (sdata->vif.type != NL802154_IFTYPE_MONITOR)
++		if (sdata->wpan_dev.iftype != NL802154_IFTYPE_MONITOR)
 +			continue;
 +
 +		if (!ieee802154_sdata_running(sdata))
@@ -19223,20 +21076,21 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 +		if (skb2) {
 +			skb2->dev = sdata->dev;
 +			ieee802154_deliver_skb(skb2);
- 
--	queue_work(priv->dev_workqueue, &work->work);
++
 +			sdata->dev->stats.rx_packets++;
 +			sdata->dev->stats.rx_bytes += skb->len;
 +		}
 +	}
 +}
 +
-+void ieee802154_rx(struct ieee802154_hw *hw, struct sk_buff *skb)
++void ieee802154_rx(struct ieee802154_local *local, struct sk_buff *skb)
 +{
-+	struct ieee802154_local *local = hw_to_local(hw);
 +	u16 crc;
 +
 +	WARN_ON_ONCE(softirq_count() == 0);
++
++	if (local->suspended)
++		goto drop;
 +
 +	/* TODO: When a transceiver omits the checksum here, we
 +	 * add an own calculated one. This is currently an ugly
@@ -19258,8 +21112,7 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 +		crc = crc_ccitt(0, skb->data, skb->len);
 +		if (crc) {
 +			rcu_read_unlock();
-+			kfree_skb(skb);
-+			return;
++			goto drop;
 +		}
 +	}
 +	/* remove crc */
@@ -19268,8 +21121,11 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
 +	__ieee802154_rx_handle_packet(local, skb);
 +
 +	rcu_read_unlock();
++
++	return;
++drop:
++	kfree_skb(skb);
 +}
-+EXPORT_SYMBOL(ieee802154_rx);
 +
 +void
 +ieee802154_rx_irqsafe(struct ieee802154_hw *hw, struct sk_buff *skb, u8 lqi)
@@ -19283,8 +21139,8 @@ diff -urN a/net/mac802154/rx.c b/net/mac802154/rx.c
  }
  EXPORT_SYMBOL(ieee802154_rx_irqsafe);
 diff -urN a/net/mac802154/tx.c b/net/mac802154/tx.c
---- a/net/mac802154/tx.c	2015-06-03 16:51:05.347929119 +1200
-+++ b/net/mac802154/tx.c	2015-06-03 16:51:05.691929111 +1200
+--- a/net/mac802154/tx.c	2015-07-09 11:34:32.153167408 +1200
++++ b/net/mac802154/tx.c	2015-07-09 11:34:32.349265405 +1200
 @@ -10,10 +10,6 @@
   * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
   * GNU General Public License for more details.
@@ -19495,8 +21351,8 @@ diff -urN a/net/mac802154/tx.c b/net/mac802154/tx.c
 +}
 diff -urN a/net/mac802154/util.c b/net/mac802154/util.c
 --- a/net/mac802154/util.c	1970-01-01 12:00:00.000000000 +1200
-+++ b/net/mac802154/util.c	2015-06-03 16:51:05.691929111 +1200
-@@ -0,0 +1,94 @@
++++ b/net/mac802154/util.c	2015-07-09 11:34:32.349265405 +1200
+@@ -0,0 +1,102 @@
 +/* This program is free software; you can redistribute it and/or modify
 + * it under the terms of the GNU General Public License version 2
 + * as published by the Free Software Foundation.
@@ -19513,6 +21369,7 @@ diff -urN a/net/mac802154/util.c b/net/mac802154/util.c
 + */
 +
 +#include "ieee802154_i.h"
++#include "driver-ops.h"
 +
 +/* privid for wpan_phys to determine whether they belong to us or not */
 +const void *const mac802154_wpan_phy_privid = &mac802154_wpan_phy_privid;
@@ -19591,8 +21448,15 @@ diff -urN a/net/mac802154/util.c b/net/mac802154/util.c
 +	dev_consume_skb_any(skb);
 +}
 +EXPORT_SYMBOL(ieee802154_xmit_complete);
++
++void ieee802154_stop_device(struct ieee802154_local *local)
++{
++	flush_workqueue(local->workqueue);
++	hrtimer_cancel(&local->ifs_timer);
++	drv_stop(local);
++}
 diff -urN a/net/mac802154/wpan.c b/net/mac802154/wpan.c
---- a/net/mac802154/wpan.c	2015-06-03 16:51:05.351929119 +1200
+--- a/net/mac802154/wpan.c	2015-07-09 11:34:32.157169408 +1200
 +++ b/net/mac802154/wpan.c	1970-01-01 12:00:00.000000000 +1200
 @@ -1,599 +0,0 @@
 -/*
